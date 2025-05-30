@@ -1,0 +1,9 @@
+# Created by venv; see https://docs.python.org/3/library/venv.html
+bin/
+lib/
+include/
+shared/
+
+lib64
+pyvenv.cfg
+
