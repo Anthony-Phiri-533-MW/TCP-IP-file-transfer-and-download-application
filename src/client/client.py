@@ -8,6 +8,7 @@ def start_client():
     port = 1253
     download_dir = 'downloads'
 
+    list_client_files()
     try:
         client_socket.connect((host, port))
         print(f"Connected to server at {host}:{port}")
@@ -80,5 +81,12 @@ def start_client():
         client_socket.close()
         print("\nClient connection closed.")
 
+def list_client_files():
+    entries = os.listdir()
+    print("\n--------Files on client-----------")
+
+    for files in entries:
+        print(files)
+    print("------------------------------------------")
 if __name__ == "__main__":
     start_client()
