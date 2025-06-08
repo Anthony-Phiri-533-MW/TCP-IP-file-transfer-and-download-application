@@ -27,6 +27,8 @@ def start_client():
                     print(response)
                     if response == "Login successful." and action == 'login':
                         is_logged_in = True
+                        received_data = client_socket.recv(4096).decode('utf-8')
+                        print(f"\n--- Files on Server ---\n{received_data}\n-----------------------")
                     elif response == "Registration successful." and action == 'register':
                         print("Please login to continue.")
                     continue
@@ -34,16 +36,20 @@ def start_client():
                     print("Invalid action. Please register or login.")
                     continue
 
-            received_data = client_socket.recv(4096).decode('utf-8')
-            print(f"\n--- Files on Server ---\n{received_data}\n-----------------------")
-
-            action = input("Enter action (download/upload/logout/quit): ").lower()
+            action = input("Enter action (download/upload/list/logout/quit): ").lower()
             if action == 'quit':
                 break
             elif action == 'logout':
+                client_socket.send("LOGOUT:".encode('utf-8'))
+                response = client_socket.recv(1024).decode('utf-8')
+                print(response)
                 is_logged_in = False
                 username = None
-                print("Logged out.")
+                continue
+            elif action == 'list':
+                received_data = client_socket.recv(4096).decode('utf-8')
+                print(f"\n--- Files on Server ---\n{received_data}\n-----------------------")
+                client_socket.send("LIST:".encode('utf-8'))
                 continue
 
             if action == 'download':
@@ -64,6 +70,7 @@ def start_client():
                             os.makedirs(download_dir)
                         file_path = os.path.join(download_dir, file_name)
                         received_size = 0
+
                         with open(file_path, 'wb') as f:
                             while received_size < file_size:
                                 data = client_socket.recv(1024)
@@ -91,6 +98,7 @@ def start_client():
                             client_socket.sendall(data)
                     response = client_socket.recv(1024).decode('utf-8')
                     print(response)
+                    client_socket.send("LIST:".encode('utf-8'))
 
             else:
                 print("Invalid action.")
