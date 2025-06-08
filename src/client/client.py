@@ -7,74 +7,96 @@ def start_client():
     host = socket.gethostname()
     port = 1253
     download_dir = 'downloads'
+    is_logged_in = False
+    username = None
 
-    list_client_files()
     try:
         client_socket.connect((host, port))
         print(f"Connected to server at {host}:{port}")
 
-        received_data = client_socket.recv(4096).decode('utf-8')
-        print(f"\n--- Files on Server ---\n{received_data}\n-----------------------")
+        while True:
+            if not is_logged_in:
+                action = input("Enter action (register/login/quit): ").lower()
+                if action == 'quit':
+                    break
+                elif action in ['register', 'login']:
+                    username = input("Enter username: ")
+                    password = input("Enter password: ")
+                    client_socket.send(f"{action.upper()}:{username}:{password}".encode('utf-8'))
+                    response = client_socket.recv(1024).decode('utf-8')
+                    print(response)
+                    if response == "Login successful." and action == 'login':
+                        is_logged_in = True
+                    elif response == "Registration successful." and action == 'register':
+                        print("Please login to continue.")
+                    continue
+                else:
+                    print("Invalid action. Please register or login.")
+                    continue
 
-        action = input("Enter action (download/upload/quit): ").lower()
-        if action == 'quit':
-            return
+            received_data = client_socket.recv(4096).decode('utf-8')
+            print(f"\n--- Files on Server ---\n{received_data}\n-----------------------")
 
-        if action == 'download':
-            file_name = input("Enter the name of the file to download: ")
-            client_socket.send(f"DOWNLOAD:{file_name}".encode('utf-8'))
+            action = input("Enter action (download/upload/logout/quit): ").lower()
+            if action == 'quit':
+                break
+            elif action == 'logout':
+                is_logged_in = False
+                username = None
+                print("Logged out.")
+                continue
 
-            response = client_socket.recv(1024).decode('utf-8')
-            if response.startswith("Error:"):
-                print(response)
-                return
+            if action == 'download':
+                file_names = input("Enter file names to download (comma-separated): ").split(',')
+                file_names = [name.strip() for name in file_names if name.strip()]
+                if not file_names:
+                    print("No files specified.")
+                    continue
+                client_socket.send(f"DOWNLOAD:{','.join(file_names)}".encode('utf-8'))
+                for file_name in file_names:
+                    response = client_socket.recv(1024).decode('utf-8')
+                    if response.startswith("Error:"):
+                        print(response)
+                        continue
+                    if response.startswith("FILE_SIZE:"):
+                        file_size = int(response[10:])
+                        if not os.path.exists(download_dir):
+                            os.makedirs(download_dir)
+                        file_path = os.path.join(download_dir, file_name)
+                        received_size = 0
+                        with open(file_path, 'wb') as f:
+                            while received_size < file_size:
+                                data = client_socket.recv(1024)
+                                if not data:
+                                    break
+                                f.write(data)
+                                received_size += len(data)
+                        print(f"File '{file_name}' downloaded to '{download_dir}'.")
 
-            if response.startswith("FILE_SIZE:"):
-                file_size = int(response[10:])
-                if not os.path.exists(download_dir):
-                    os.makedirs(download_dir)
-                
-                file_path = os.path.join(download_dir, file_name)
-                received_size = 0
-                with open(file_path, 'wb') as f:
-                    while received_size < file_size:
-                        data = client_socket.recv(1024)
-                        if not data:
-                            break
-                        f.write(data)
-                        received_size += len(data)
-                print(f"File '{file_name}' downloaded successfully to '{download_dir}' directory.")
+            elif action == 'upload':
+                file_paths = input("Enter file paths to upload (comma-separated): ").split(',')
+                file_paths = [path.strip() for path in file_paths if path.strip()]
+                for file_path in file_paths:
+                    if not os.path.isfile(file_path):
+                        print(f"Error: File '{file_path}' not found.")
+                        continue
+                    file_name = os.path.basename(file_path)
+                    file_size = os.path.getsize(file_path)
+                    client_socket.send(f"UPLOAD:{file_name}:{file_size}".encode('utf-8'))
+                    with open(file_path, 'rb') as f:
+                        while True:
+                            data = f.read(1024)
+                            if not data:
+                                break
+                            client_socket.sendall(data)
+                    response = client_socket.recv(1024).decode('utf-8')
+                    print(response)
 
-        elif action == 'upload':
-            file_path = input("Enter the path of the file to upload: ")
-            if not os.path.isfile(file_path):
-                print(f"Error: File '{file_path}' not found.")
-                return
-            
-            file_name = os.path.basename(file_path)
-            file_size = os.path.getsize(file_path)
-            client_socket.send(f"UPLOAD:{file_name}:{file_size}".encode('utf-8'))
-
-            with open(file_path, 'rb') as f:
-                while True:
-                    data = f.read(1024)
-                    if not data:
-                        break
-                    client_socket.sendall(data)
-            
-            response = client_socket.recv(1024).decode('utf-8')
-            print(response)
-
-        message = "Hello from the client!"
-        print(f"\nSending: '{message}' to server")
-        client_socket.send(message.encode('utf-8'))
-
-        time.sleep(0.1)
-        server_response = client_socket.recv(1024).decode('utf-8')
-        print(f"Received response from server: '{server_response}'")
+            else:
+                print("Invalid action.")
 
     except ConnectionRefusedError:
-        print(f"Error: Connection refused. Make sure the server is running on {host}:{port}")
+        print(f"Error: Connection refused. Ensure server is running on {host}:{port}")
     except Exception as e:
         print(f"An error occurred: {e}")
     finally:
@@ -84,9 +106,10 @@ def start_client():
 def list_client_files():
     entries = os.listdir()
     print("\n--------Files on client-----------")
-
     for files in entries:
         print(files)
     print("------------------------------------------")
+
 if __name__ == "__main__":
+    list_client_files()
     start_client()
