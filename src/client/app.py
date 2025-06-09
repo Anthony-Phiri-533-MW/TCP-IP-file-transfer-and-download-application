@@ -4,7 +4,7 @@ import sys
 import time
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QPushButton, QListWidget, QLineEdit, QLabel, QFileDialog, QMessageBox,
-                            QDialog, QFormLayout, QProgressBar, QFrame, QAction, QMenuBar)
+                            QDialog, QFormLayout, QProgressBar, QFrame, QAction, QMenuBar, QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPalette, QColor, QFont
 
@@ -13,7 +13,7 @@ class FileTransferThread(QThread):
     update_file_list = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
     login_status = pyqtSignal(bool)
-    transfer_progress = pyqtSignal(int, int)  # current, total
+    transfer_progress = pyqtSignal(str, int, int)  # filename, current, total
 
     def __init__(self):
         super().__init__()
@@ -22,6 +22,7 @@ class FileTransferThread(QThread):
         self.action = None
         self.file_names = []
         self.file_paths = []
+        self.is_private = False
         self.username = None
         self.password = None
         self.download_dir = 'downloads'
@@ -30,12 +31,13 @@ class FileTransferThread(QThread):
         self.is_logged_in = False
         self.current_file_size = 0
 
-    def set_action(self, action, file_names=None, file_paths=None, username=None, password=None):
+    def set_action(self, action, file_names=None, file_paths=None, username=None, password=None, is_private=False):
         self.action = action
         self.file_names = file_names if file_names else []
         self.file_paths = file_paths if file_paths else []
         self.username = username
         self.password = password
+        self.is_private = is_private
 
     def connect_to_server(self):
         try:
@@ -150,7 +152,7 @@ class FileTransferThread(QThread):
                                 break
                             f.write(data)
                             received_size += len(data)
-                            self.transfer_progress.emit(received_size, file_size)
+                            self.transfer_progress.emit(file_name, received_size, file_size)
                             
                     self.update_status.emit(f"Downloaded '{file_name}' to '{self.download_dir}'")
                 except Exception as e:
@@ -168,7 +170,8 @@ class FileTransferThread(QThread):
             file_size = os.path.getsize(file_path)
             self.current_file_size = file_size
             
-            self.client_socket.send(f"UPLOAD:{file_name}:{file_size}".encode('utf-8'))
+            is_private = 1 if self.is_private else 0
+            self.client_socket.send(f"UPLOAD:{file_name}:{file_size}:{is_private}".encode('utf-8'))
             
             try:
                 with open(file_path, 'rb') as f:
@@ -179,7 +182,7 @@ class FileTransferThread(QThread):
                             break
                         self.client_socket.sendall(data)
                         bytes_sent += len(data)
-                        self.transfer_progress.emit(bytes_sent, file_size)
+                        self.transfer_progress.emit(file_name, bytes_sent, file_size)
                         
                 response = self.client_socket.recv(1024).decode('utf-8')
                 self.update_status.emit(response)
@@ -238,23 +241,70 @@ class LoginDialog(QDialog):
     def apply_theme(self):
         palette = self.palette()
         if self.dark_mode:
-            palette.setColor(QPalette.Window, QColor("#1A2233"))
+            palette.setColor(QPalette.Window, QColor("#1E293B"))
             palette.setColor(QPalette.WindowText, QColor("#F0F2F5"))
-            palette.setColor(QPalette.Base, QColor("#1A2233"))
+            palette.setColor(QPalette.Base, QColor("#1E293B"))
             palette.setColor(QPalette.Text, QColor("#F0F2F5"))
-            palette.setColor(QPalette.Button, QColor("#336DFF"))
+            palette.setColor(QPalette.Button, QColor("#38BDF8"))
             palette.setColor(QPalette.ButtonText, QColor("#F0F2F5"))
         else:
             palette.setColor(QPalette.Window, QColor("#F7F9FC"))
             palette.setColor(QPalette.WindowText, QColor("#212529"))
             palette.setColor(QPalette.Base, QColor("#FFFFFF"))
             palette.setColor(QPalette.Text, QColor("#212529"))
-            palette.setColor(QPalette.Button, QColor("#007BFF"))
+            palette.setColor(QPalette.Button, QColor("#38BDF8"))
             palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
         self.setPalette(palette)
 
     def get_credentials(self):
         return self.username_input.text().strip(), self.password_input.text().strip()
+
+class UploadDialog(QDialog):
+    def __init__(self, parent=None, dark_mode=False):
+        super().__init__(parent)
+        self.dark_mode = dark_mode
+        self.setWindowTitle("Upload Files")
+        self.setMinimumWidth(300)
+        self.init_ui()
+        self.apply_theme()
+
+    def init_ui(self):
+        layout = QFormLayout()
+        
+        self.private_check = QCheckBox("Make files private (only visible to you)")
+        
+        buttons = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(ok_btn)
+        buttons.addWidget(cancel_btn)
+        
+        layout.addRow(self.private_check)
+        layout.addRow(buttons)
+        self.setLayout(layout)
+
+    def apply_theme(self):
+        palette = self.palette()
+        if self.dark_mode:
+            palette.setColor(QPalette.Window, QColor("#1E293B"))
+            palette.setColor(QPalette.WindowText, QColor("#F0F2F5"))
+            palette.setColor(QPalette.Base, QColor("#1E293B"))
+            palette.setColor(QPalette.Text, QColor("#F0F2F5"))
+            palette.setColor(QPalette.Button, QColor("#38BDF8"))
+            palette.setColor(QPalette.ButtonText, QColor("#F0F2F5"))
+        else:
+            palette.setColor(QPalette.Window, QColor("#F7F9FC"))
+            palette.setColor(QPalette.WindowText, QColor("#212529"))
+            palette.setColor(QPalette.Base, QColor("#FFFFFF"))
+            palette.setColor(QPalette.Text, QColor("#212529"))
+            palette.setColor(QPalette.Button, QColor("#38BDF8"))
+            palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
+        self.setPalette(palette)
+
+    def is_private(self):
+        return self.private_check.isChecked()
 
 class ClientGUI(QMainWindow):
     def __init__(self):
@@ -267,6 +317,7 @@ class ClientGUI(QMainWindow):
         self.dark_mode = False
         self.init_ui()
         self.apply_theme()
+        self.setAcceptDrops(True)
 
     def init_ui(self):
         central_widget = QWidget()
@@ -317,6 +368,10 @@ class ClientGUI(QMainWindow):
         layout.addWidget(self.status_label)
 
         # Progress bar
+        self.progress_label = QLabel("Transfer Progress:")
+        self.progress_label.setVisible(False)
+        layout.addWidget(self.progress_label)
+        
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setFixedHeight(8)
@@ -328,11 +383,12 @@ class ClientGUI(QMainWindow):
         file_layout = QVBoxLayout(file_frame)
         file_layout.setContentsMargins(10, 10, 10, 10)
         
-        file_label = QLabel("Files on Server:")
+        file_label = QLabel("Files on Server: (Drag and drop files here to upload)")
         file_label.setStyleSheet("font-weight: bold;")
         
         self.file_list = QListWidget()
         self.file_list.setSelectionMode(QListWidget.MultiSelection)
+        self.file_list.setAcceptDrops(True)
         
         file_layout.addWidget(file_label)
         file_layout.addWidget(self.file_list)
@@ -367,22 +423,22 @@ class ClientGUI(QMainWindow):
     def apply_theme(self):
         palette = self.palette()
         if self.dark_mode:
-            palette.setColor(QPalette.Window, QColor("#121826"))
+            palette.setColor(QPalette.Window, QColor("#1E293B"))
             palette.setColor(QPalette.WindowText, QColor("#F0F2F5"))
-            palette.setColor(QPalette.Base, QColor("#1A2233"))
+            palette.setColor(QPalette.Base, QColor("#1E293B"))
             palette.setColor(QPalette.Text, QColor("#F0F2F5"))
-            palette.setColor(QPalette.Button, QColor("#336DFF"))
+            palette.setColor(QPalette.Button, QColor("#38BDF8"))
             palette.setColor(QPalette.ButtonText, QColor("#F0F2F5"))
-            palette.setColor(QPalette.Highlight, QColor("#00C49A"))
-            palette.setColor(QPalette.HighlightedText, QColor("#121826"))
+            palette.setColor(QPalette.Highlight, QColor("#10B981"))
+            palette.setColor(QPalette.HighlightedText, QColor("#1E293B"))
         else:
             palette.setColor(QPalette.Window, QColor("#F7F9FC"))
             palette.setColor(QPalette.WindowText, QColor("#212529"))
             palette.setColor(QPalette.Base, QColor("#FFFFFF"))
             palette.setColor(QPalette.Text, QColor("#212529"))
-            palette.setColor(QPalette.Button, QColor("#007BFF"))
+            palette.setColor(QPalette.Button, QColor("#38BDF8"))
             palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-            palette.setColor(QPalette.Highlight, QColor("#28A745"))
+            palette.setColor(QPalette.Highlight, QColor("#10B981"))
             palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
         self.setPalette(palette)
 
@@ -412,6 +468,27 @@ class ClientGUI(QMainWindow):
     def toggle_theme(self):
         self.dark_mode = not self.dark_mode
         self.apply_theme()
+
+    def dragEnterEvent(self, event):
+        if self.is_logged_in and event.mimeData().hasUrls():
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        if not self.is_logged_in:
+            return
+            
+        files = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if files:
+            dialog = UploadDialog(self, dark_mode=self.dark_mode)
+            if dialog.exec_():
+                is_private = dialog.is_private()
+                self.start_transfer_thread()
+                self.progress_bar.setVisible(True)
+                self.progress_label.setVisible(True)
+                self.progress_bar.setValue(0)
+                self.thread.set_action('upload', file_paths=files, is_private=is_private)
 
     def show_login_dialog(self):
         dialog = LoginDialog(self, dark_mode=self.dark_mode)
@@ -469,6 +546,7 @@ class ClientGUI(QMainWindow):
             self.refresh_btn.setEnabled(False)
             self.file_list.clear()
             self.progress_bar.setVisible(False)
+            self.progress_label.setVisible(False)
 
     def refresh_file_list(self):
         if self.thread and self.thread.isRunning():
@@ -510,30 +588,38 @@ class ClientGUI(QMainWindow):
         file_names = [item.text() for item in selected_items]
         if self.thread and self.thread.isRunning():
             self.progress_bar.setVisible(True)
+            self.progress_label.setVisible(True)
             self.progress_bar.setValue(0)
             self.thread.set_action('download', file_names=file_names)
 
     def upload_files(self):
         file_paths, _ = QFileDialog.getOpenFileNames(self, "Select Files to Upload")
         if file_paths:
-            if self.thread and self.thread.isRunning():
-                self.progress_bar.setVisible(True)
-                self.progress_bar.setValue(0)
-                self.thread.set_action('upload', file_paths=file_paths)
+            dialog = UploadDialog(self, dark_mode=self.dark_mode)
+            if dialog.exec_():
+                is_private = dialog.is_private()
+                if self.thread and self.thread.isRunning():
+                    self.progress_bar.setVisible(True)
+                    self.progress_label.setVisible(True)
+                    self.progress_bar.setValue(0)
+                    self.thread.set_action('upload', file_paths=file_paths, is_private=is_private)
 
     def update_status(self, message):
         self.status_label.setText(f"Status: {message}")
 
-    def update_progress(self, current, total):
+    def update_progress(self, filename, current, total):
         if total > 0:
             progress = int((current / total) * 100)
+            self.progress_label.setText(f"Transfer Progress: {filename} ({current:,}/{total:,} bytes)")
             self.progress_bar.setValue(progress)
             if progress >= 100:
                 self.progress_bar.setVisible(False)
+                self.progress_label.setVisible(False)
 
     def show_error(self, message):
         QMessageBox.critical(self, "Error", message)
         self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
 
     def closeEvent(self, event):
         if self.thread and self.thread.isRunning():
