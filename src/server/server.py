@@ -4,13 +4,14 @@ import threading
 import socket
 import sqlite3
 import shutil
+import hashlib
 from datetime import datetime, timedelta
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                             QPushButton, QListWidget, QTextEdit, QLabel, QTabWidget, QFrame,
                             QAction, QMenuBar, QDialog, QFormLayout, QLineEdit, QComboBox,
-                            QMessageBox, QInputDialog)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QPalette, QColor, QFont
+                            QMessageBox, QInputDialog, QGraphicsDropShadowEffect, QStatusBar)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPropertyAnimation, QSize
+from PyQt5.QtGui import QPalette, QColor, QFont, QIcon
 
 def adapt_datetime(dt):
     return dt.isoformat()
@@ -31,16 +32,19 @@ def init_db():
                       file_name TEXT NOT NULL,
                       client_address TEXT,
                       timestamp DATETIME NOT NULL,
-                      user_id TEXT)''')
+                      user_id TEXT,
+                      speed REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS files
                      (file_name TEXT PRIMARY KEY,
                       upload_date DATETIME NOT NULL,
                       user_id TEXT,
                       is_private INTEGER DEFAULT 0,
-                      size INTEGER)''')
+                      size INTEGER,
+                      checksum TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS users
                      (username TEXT PRIMARY KEY,
-                      password TEXT NOT NULL)''')
+                      password TEXT NOT NULL,
+                      display_name TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS file_shares
                      (file_name TEXT,
                       shared_with_user TEXT,
@@ -58,10 +62,17 @@ class ServerThread(QThread):
         super().__init__()
         self.server_socket = None
         self.running = False
-        self.host = socket.gethostname()
+        self.host = '0.0.0.0'  # Listen on all interfaces
         self.port = 1253
         self.active_connections = 0
         init_db()
+
+    def calculate_checksum(self, file_path):
+        hash_md5 = hashlib.md5()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
 
     def list_server_files(self, user_id):
         try:
@@ -102,7 +113,7 @@ class ServerThread(QThread):
                 cursor.execute("""
                     SELECT file_name FROM files 
                     WHERE (is_private = 0 OR user_id = ? OR file_name IN (SELECT file_name FROM file_shares WHERE shared_with_user = ?))
-                    AND file_name LIKE ?
+                    AND file_name LIKE ? COLLATE NOCASE
                 """, (user_id, user_id, f"%{query}%"))
                 files = [row[0] for row in cursor.fetchall()]
                 public_files = [f for f in files if not self.is_private_file(f, user_id)]
@@ -134,7 +145,8 @@ class ServerThread(QThread):
             'total_storage_gb': 0.0,
             'files_per_user': {},
             'downloads_per_user': {},
-            'active_connections': self.active_connections
+            'active_connections': self.active_connections,
+            'average_speed': 0.0
         }
         
         try:
@@ -167,6 +179,9 @@ class ServerThread(QThread):
                 cursor.execute("SELECT user_id, COUNT(*) FROM downloads WHERE timestamp >= ? GROUP BY user_id", (start_date,))
                 stats['downloads_per_user'] = dict(cursor.fetchall() or [])
                 
+                cursor.execute("SELECT AVG(speed) FROM downloads WHERE timestamp >= ?", (start_date,))
+                stats['average_speed'] = cursor.fetchone()[0] or 0
+                
         except sqlite3.Error as e:
             self.log_message.emit(f"Database error getting stats: {str(e)}")
             
@@ -176,8 +191,8 @@ class ServerThread(QThread):
         try:
             with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT username FROM users")
-                users = [row[0] for row in cursor.fetchall()]
+                cursor.execute("SELECT username, display_name FROM users")
+                users = [f"{row[0]} ({row[1]})" if row[1] else row[0] for row in cursor.fetchall()]
             return users
         except Exception as e:
             self.log_message.emit(f"Error listing users: {str(e)}")
@@ -211,6 +226,7 @@ class ServerThread(QThread):
                             has_access = True
                 
                 if has_access:
+                    start_time = datetime.now()
                     if os.path.isdir(file_path):
                         zip_path = file_path + '.zip'
                         shutil.make_archive(file_path, 'zip', file_path)
@@ -220,7 +236,7 @@ class ServerThread(QThread):
                         with open(zip_path, 'rb') as f:
                             f.seek(offset)
                             while True:
-                                data = f.read(1024)
+                                data = f.read(4096)
                                 if not data:
                                     break
                                 client_socket.sendall(data)
@@ -232,15 +248,20 @@ class ServerThread(QThread):
                         with open(file_path, 'rb') as f:
                             f.seek(offset)
                             while True:
-                                data = f.read(1024)
+                                data = f.read(4096)
                                 if not data:
                                     break
                                 client_socket.sendall(data)
                     
-                    self.log_message.emit(f"Sent '{file_name}' to {client_address}")
+                    transfer_time = (datetime.now() - start_time).total_seconds()
+                    speed = (file_size / (1024 * 1024)) / transfer_time if transfer_time > 0 else 0  # MB/s
                     
-                    conn.execute("INSERT INTO downloads (file_name, client_address, timestamp, user_id) VALUES (?, ?, ?, ?)",
-                               (file_name, str(client_address), datetime.now(), user_id))
+                    self.log_message.emit(f"Sent '{file_name}' to {client_address} (Speed: {speed:.2f} MB/s)")
+                    
+                    conn.execute("""
+                        INSERT INTO downloads (file_name, client_address, timestamp, user_id, speed)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (file_name, str(client_address), datetime.now(), user_id, speed))
                     
                     self.stats_updated.emit(self.get_stats())
                 else:
@@ -255,62 +276,85 @@ class ServerThread(QThread):
 
     def receive_file_from_client(self, client_socket, file_name, file_size, client_address, user_id, is_private, is_folder):
         file_path = os.path.join(SERVER_FILES_DIR, file_name)
+        temp_path = file_path + '.tmp'
         
         try:
             if is_folder:
-                zip_path = file_path + '.zip'
+                zip_path = temp_path + '.zip'
                 received_size = 0
+                start_time = datetime.now()
                 with open(zip_path, 'wb') as f:
                     while received_size < file_size:
-                        data = client_socket.recv(1024)
-                        if not data:
-                            break
-                        f.write(data)
-                        received_size += len(data)
-                
-                if received_size == file_size:
-                    os.makedirs(file_path, exist_ok=True)
-                    shutil.unpack_archive(zip_path, file_path, 'zip')
-                    os.remove(zip_path)
-                    for root, _, files in os.walk(file_path):
-                        for fname in files:
-                            rel_path = os.path.relpath(os.path.join(root, fname), SERVER_FILES_DIR)
-                            with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-                                conn.execute("INSERT OR REPLACE INTO files (file_name, upload_date, user_id, is_private, size) VALUES (?, ?, ?, ?, ?)",
-                                           (rel_path, datetime.now(), user_id, is_private, os.path.getsize(os.path.join(root, fname))))
-                else:
-                    raise Exception("Incomplete folder transfer")
-            else:
-                received_size = 0
-                with open(file_path, 'wb') as f:
-                    while received_size < file_size:
-                        data = client_socket.recv(1024)
+                        data = client_socket.recv(min(4096, file_size - received_size))
                         if not data:
                             break
                         f.write(data)
                         received_size += len(data)
                 
                 if received_size != file_size:
-                    raise Exception("Incomplete file transfer")
-            
-            client_socket.send(f"File '{file_name}' uploaded successfully.".encode('utf-8'))
-            self.log_message.emit(f"Received '{file_name}' from {client_address}")
-            
-            if not is_folder:
+                    raise Exception(f"Incomplete folder transfer. Expected {file_size} bytes, received {received_size}")
+                
+                os.makedirs(file_path, exist_ok=True)
+                shutil.unpack_archive(zip_path, file_path, 'zip')
+                os.remove(zip_path)
+                
+                transfer_time = (datetime.now() - start_time).total_seconds()
+                speed = (file_size / (1024 * 1024)) / transfer_time if transfer_time > 0 else 0  # MB/s
+                
+                for root, _, files in os.walk(file_path):
+                    for fname in files:
+                        rel_path = os.path.relpath(os.path.join(root, fname), SERVER_FILES_DIR)
+                        full_path = os.path.join(root, fname)
+                        checksum = self.calculate_checksum(full_path)
+                        with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+                            conn.execute("""
+                                INSERT OR REPLACE INTO files 
+                                (file_name, upload_date, user_id, is_private, size, checksum) 
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            """, (rel_path, datetime.now(), user_id, is_private, os.path.getsize(full_path), checksum))
+            else:
+                received_size = 0
+                start_time = datetime.now()
+                with open(temp_path, 'wb') as f:
+                    while received_size < file_size:
+                        data = client_socket.recv(min(4096, file_size - received_size))
+                        if not data:
+                            break
+                        f.write(data)
+                        received_size += len(data)
+                
+                if received_size != file_size:
+                    raise Exception(f"Incomplete file transfer. Expected {file_size} bytes, received {received_size}")
+                
+                transfer_time = (datetime.now() - start_time).total_seconds()
+                speed = (file_size / (1024 * 1024)) / transfer_time if transfer_time > 0 else 0  # MB/s
+                
+                checksum = self.calculate_checksum(temp_path)
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                os.rename(temp_path, file_path)
+                
                 with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-                    conn.execute("INSERT OR REPLACE INTO files (file_name, upload_date, user_id, is_private, size) VALUES (?, ?, ?, ?, ?)",
-                               (file_name, datetime.now(), user_id, is_private, file_size))
+                    conn.execute("""
+                        INSERT OR REPLACE INTO files 
+                        (file_name, upload_date, user_id, is_private, size, checksum) 
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (file_name, datetime.now(), user_id, is_private, file_size, checksum))
+            
+            client_socket.send(f"File '{file_name}' uploaded successfully (Speed: {speed:.2f} MB/s).".encode('utf-8'))
+            self.log_message.emit(f"Received '{file_name}' from {client_address} (Speed: {speed:.2f} MB/s)")
             
             self.file_list_updated.emit(self.list_server_files(user_id))
             self.stats_updated.emit(self.get_stats())
                 
         except Exception as e:
             self.log_message.emit(f"Error receiving file '{file_name}': {str(e)}")
-            if os.path.exists(file_path):
-                if os.path.isdir(file_path):
-                    shutil.rmtree(file_path)
-                else:
-                    os.remove(file_path)
+            for path in [temp_path, file_path, temp_path + '.zip']:
+                if os.path.exists(path):
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
             try:
                 client_socket.send(f"Error: {str(e)}".encode('utf-8'))
             except:
@@ -354,14 +398,18 @@ class ServerThread(QThread):
                         self.handle_search(client_socket, data[7:], user_id)
                     elif data.startswith("DELETE_FILE:"):
                         self.handle_delete_file(client_socket, data[12:], user_id)
+                    elif data.startswith("GET_DISPLAY_NAME:"):
+                        self.handle_get_display_name(client_socket, data[16:])
+                    elif data.startswith("UPDATE_DISPLAY_NAME:"):
+                        self.handle_update_display_name(client_socket, data[19:], user_id)
                     else:
                         client_socket.send(f"Unknown command: {data[:100]}".encode('utf-8'))
                         
-                except ConnectionResetError:
-                    self.log_message.emit(f"Connection reset by {client_address}")
+                except ConnectionResetError as e:
+                    self.error_occurred.emit(f"Connection reset by {client_address}")
                     break
                 except Exception as e:
-                    self.log_message.emit(f"Error with {client_address}: {str(e)}")
+                    self.error_occurred.emit(f"Error with {client_address}: {str(e)}")
                     try:
                         client_socket.send(f"Error: {str(e)}".encode('utf-8'))
                     except:
@@ -480,7 +528,8 @@ class ServerThread(QThread):
             with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT user_id FROM files WHERE file_name = ? AND is_private = 1", (file_name,))
-                if cursor.fetchone()[0] != user_id:
+                result = cursor.fetchone()
+                if not result or result[0] != user_id:
                     client_socket.send("Error: You can only share your private files.".encode('utf-8'))
                     return
                     
@@ -582,6 +631,32 @@ class ServerThread(QThread):
             client_socket.send(f"Error: {str(e)}".encode('utf-8'))
             self.log_message.emit(f"Error deleting file '{file_name}': {str(e)}")
 
+    def handle_get_display_name(self, client_socket, username):
+        try:
+            with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT display_name FROM users WHERE username = ?", (username,))
+                result = cursor.fetchone()
+                display_name = result[0] if result and result[0] else username
+                client_socket.send(display_name.encode('utf-8'))
+        except Exception as e:
+            client_socket.send(username.encode('utf-8'))
+
+    def handle_update_display_name(self, client_socket, data, user_id):
+        if not user_id:
+            client_socket.send("Error: Authentication required.".encode('utf-8'))
+            return
+            
+        try:
+            with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+                conn.execute("UPDATE users SET display_name = ? WHERE username = ?", (data, user_id))
+                conn.commit()
+                client_socket.send("Display name updated successfully.".encode('utf-8'))
+                self.log_message.emit(f"User '{user_id}' updated display name to '{data}'")
+                self.user_list_updated.emit(self.get_users())
+        except Exception as e:
+            client_socket.send(f"Error: {str(e)}".encode('utf-8'))
+
     def run(self):
         if os.geteuid() == 0:
             self.log_message.emit("Warning: Running as root is not recommended. Consider running as a regular user to avoid GUI issues.")
@@ -627,23 +702,30 @@ class ServerThread(QThread):
                 pass
         self.log_message.emit("Server stopped.")
 
+# [Previous server code remains the same until the UserDialog class]
+
 class UserDialog(QDialog):
-    def __init__(self, parent=None, dark_mode=False):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.dark_mode = dark_mode
         self.setWindowTitle("Manage User")
         self.init_ui()
-        self.apply_theme()
 
     def init_ui(self):
         layout = QFormLayout()
         
         self.username_input = QLineEdit()
+        self.username_input.setPlaceholderText("Enter username")
+        
         self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("Enter password")
         self.password_input.setEchoMode(QLineEdit.Password)
+        
+        self.display_name_input = QLineEdit()
+        self.display_name_input.setPlaceholderText("Enter display name (optional)")
         
         layout.addRow("Username:", self.username_input)
         layout.addRow("Password:", self.password_input)
+        layout.addRow("Display Name:", self.display_name_input)
         
         buttons = QHBoxLayout()
         ok_btn = QPushButton("OK")
@@ -656,51 +738,99 @@ class UserDialog(QDialog):
         layout.addRow(buttons)
         self.setLayout(layout)
 
-    def apply_theme(self):
-        palette = self.palette()
-        if self.dark_mode:
-            palette.setColor(QPalette.Window, QColor("#1E1E2F"))
-            palette.setColor(QPalette.WindowText, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Base, QColor("#1E1E2F"))
-            palette.setColor(QPalette.Text, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Button, QColor("#4A90E2"))
-            palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-        else:
-            palette.setColor(QPalette.Window, QColor("#F5F7FA"))
-            palette.setColor(QPalette.WindowText, QColor("#2C3E50"))
-            palette.setColor(QPalette.Base, QColor("#F5F7FA"))
-            palette.setColor(QPalette.Text, QColor("#2C3E50"))
-            palette.setColor(QPalette.Button, QColor("#2E7D32"))
-            palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-        self.setPalette(palette)
-
     def get_credentials(self):
-        return self.username_input.text().strip(), self.password_input.text().strip()
+        return (
+            self.username_input.text().strip(),
+            self.password_input.text().strip(),
+            self.display_name_input.text().strip()
+        )
 
 class ServerGUI(QMainWindow):
-    stats_updated = pyqtSignal(dict)
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("File Transfer Server")
-        self.setGeometry(100, 100, 900, 600)
+        self.setGeometry(100, 100, 1000, 700)
         self.server_thread = None
-        self.dark_mode = True
         self.init_ui()
-        self.apply_theme()
 
     def init_ui(self):
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f7fa;
+            }
+            QFrame {
+                background-color: white;
+                border-radius: 8px;
+                border: 1px solid #e0e0e0;
+            }
+            QPushButton {
+                background-color: #4a6fa5;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #3a5a8f;
+            }
+            QPushButton:pressed {
+                background-color: #2a4a7f;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+            QListWidget, QTextEdit, QLineEdit {
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                padding: 8px;
+                background-color: white;
+                color: #333333;
+            }
+            QTabWidget::pane {
+                border: 1px solid #e0e0e0;
+                border-radius: 8px;
+            }
+            QTabBar::tab {
+                padding: 8px 16px;
+                background-color: #e0e0e0;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                margin-right: 4px;
+            }
+            QTabBar::tab:selected {
+                background-color: white;
+                border-bottom: 2px solid #4a6fa5;
+            }
+            QLabel {
+                color: #333333;
+            }
+            QProgressBar {
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                text-align: center;
+                background-color: white;
+            }
+            QProgressBar::chunk {
+                background-color: #4a6fa5;
+                border-radius: 4px;
+            }
+        """)
+
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
 
+        # Header
+        header = QLabel("File Transfer Server Dashboard")
+        header.setStyleSheet("font-size: 20px; font-weight: bold; color: #333333;")
+        layout.addWidget(header)
+
         # Control buttons
         control_frame = QFrame()
-        control_frame.setFrameShape(QFrame.StyledPanel)
         control_layout = QHBoxLayout(control_frame)
-        control_layout.setContentsMargins(10, 10, 10, 10)
         
         self.start_btn = QPushButton("Start Server")
         self.start_btn.clicked.connect(self.start_server)
@@ -711,13 +841,10 @@ class ServerGUI(QMainWindow):
         self.stop_btn.setFixedHeight(40)
         self.stop_btn.setEnabled(False)
         
-        self.theme_btn = QPushButton("Light Mode")
-        self.theme_btn.clicked.connect(self.toggle_theme)
-        self.theme_btn.setFixedHeight(40)
-        
         control_layout.addWidget(self.start_btn)
         control_layout.addWidget(self.stop_btn)
-        control_layout.addWidget(self.theme_btn)
+        control_layout.addStretch()
+        
         layout.addWidget(control_frame)
 
         # Tabs
@@ -727,13 +854,12 @@ class ServerGUI(QMainWindow):
         # Files Tab
         files_tab = QWidget()
         files_layout = QVBoxLayout(files_tab)
-        files_layout.setContentsMargins(10, 10, 10, 10)
         
-        files_label = QLabel("Server Files:")
+        files_label = QLabel("Server Files")
         files_label.setStyleSheet("font-weight: bold;")
         
         self.file_list = QListWidget()
-        self.file_list.itemSelectionChanged.connect(lambda: self.highlight_button(self.file_list))
+        self.file_list.setSelectionMode(QListWidget.ExtendedSelection)
         
         files_layout.addWidget(files_label)
         files_layout.addWidget(self.file_list)
@@ -742,9 +868,8 @@ class ServerGUI(QMainWindow):
         # Statistics Tab
         stats_tab = QWidget()
         stats_layout = QVBoxLayout(stats_tab)
-        stats_layout.setContentsMargins(10, 10, 10, 10)
         
-        stats_label = QLabel("Statistics:")
+        stats_label = QLabel("Statistics")
         stats_label.setStyleSheet("font-weight: bold;")
         
         timeframe_layout = QHBoxLayout()
@@ -767,9 +892,8 @@ class ServerGUI(QMainWindow):
         # User Management Tab
         users_tab = QWidget()
         users_layout = QVBoxLayout(users_tab)
-        users_layout.setContentsMargins(10, 10, 10, 10)
         
-        users_label = QLabel("Users:")
+        users_label = QLabel("User Management")
         users_label.setStyleSheet("font-weight: bold;")
         
         user_btn_layout = QHBoxLayout()
@@ -779,9 +903,9 @@ class ServerGUI(QMainWindow):
         delete_user_btn.clicked.connect(self.delete_user)
         user_btn_layout.addWidget(add_user_btn)
         user_btn_layout.addWidget(delete_user_btn)
+        user_btn_layout.addStretch()
         
         self.user_list = QListWidget()
-        self.user_list.itemSelectionChanged.connect(lambda: self.highlight_button(self.user_list))
         
         users_layout.addWidget(users_label)
         users_layout.addLayout(user_btn_layout)
@@ -790,11 +914,9 @@ class ServerGUI(QMainWindow):
 
         # Log Display
         log_frame = QFrame()
-        log_frame.setFrameShape(QFrame.StyledPanel)
         log_layout = QVBoxLayout(log_frame)
-        log_layout.setContentsMargins(10, 10, 10, 15)
         
-        log_label = QLabel("Server Logs:")
+        log_label = QLabel("Server Logs")
         log_label.setStyleSheet("font-weight: bold;")
         
         self.log_display = QTextEdit()
@@ -804,61 +926,137 @@ class ServerGUI(QMainWindow):
         log_layout.addWidget(self.log_display)
         layout.addWidget(log_frame)
 
+        # Status bar
+        self.statusBar().showMessage("Ready")
+        self.statusBar().setStyleSheet("""
+            QStatusBar {
+                border-top: 1px solid palette(mid);
+            }
+        """)
+
+        # Window shadow effect
+        self.shadow = QGraphicsDropShadowEffect()
+        self.shadow.setBlurRadius(15)
+        self.shadow.setColor(QColor(0, 0, 0, 150))
+        self.shadow.setOffset(0, 0)
+        central_widget.setGraphicsEffect(self.shadow)
+
     def apply_theme(self):
         palette = QPalette()
         if self.dark_mode:
-            palette.setColor(QPalette.Window, QColor("#1E1E2F"))
+            # Modern dark theme
+            palette.setColor(QPalette.Window, QColor("#121212"))
             palette.setColor(QPalette.WindowText, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Base, QColor("#1E1E2F"))
-            palette.setColor(QPalette.Text, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Button, QColor("#4A90E2"))
+            palette.setColor(QPalette.Base, QColor("#1E1E1E"))
+            palette.setColor(QPalette.AlternateBase, QColor("#2D2D2D"))
+            palette.setColor(QPalette.Text, QColor("#FFFFFF"))
+            palette.setColor(QPalette.Button, QColor("#333333"))
             palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-            palette.setColor(QPalette.Highlight, QColor("#FF6B6B"))
-            palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
+            palette.setColor(QPalette.Highlight, QColor("#BB86FC"))  # Purple accent
+            palette.setColor(QPalette.HighlightedText, QColor("#000000"))
+            palette.setColor(QPalette.ToolTipBase, QColor("#BB86FC"))
+            palette.setColor(QPalette.ToolTipText, QColor("#000000"))
             self.theme_btn.setText("Light Mode")
+            
+            # Title bar style
+            self.title_bar.setStyleSheet("""
+                background-color: #1E1E1E;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+            """)
+            self.title_label.setStyleSheet("color: #FFFFFF; font-weight: bold; font-size: 14px;")
         else:
-            palette.setColor(QPalette.Window, QColor("#F5F7FA"))
-            palette.setColor(QPalette.WindowText, QColor("#2C3E50"))
-            palette.setColor(QPalette.Base, QColor("#F5F7FA"))
-            palette.setColor(QPalette.Text, QColor("#2C3E50"))
-            palette.setColor(QPalette.Button, QColor("#2E7D32"))
-            palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-            palette.setColor(QPalette.Highlight, QColor("#4CAF50"))
+            # Modern light theme
+            palette.setColor(QPalette.Window, QColor("#F5F5F5"))
+            palette.setColor(QPalette.WindowText, QColor("#212121"))
+            palette.setColor(QPalette.Base, QColor("#FFFFFF"))
+            palette.setColor(QPalette.AlternateBase, QColor("#F5F5F5"))
+            palette.setColor(QPalette.Text, QColor("#212121"))
+            palette.setColor(QPalette.Button, QColor("#E0E0E0"))
+            palette.setColor(QPalette.ButtonText, QColor("#212121"))
+            palette.setColor(QPalette.Highlight, QColor("#6200EE"))  # Purple accent
             palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
+            palette.setColor(QPalette.ToolTipBase, QColor("#FFFFFF"))
+            palette.setColor(QPalette.ToolTipText, QColor("#212121"))
             self.theme_btn.setText("Dark Mode")
+            
+            # Title bar style
+            self.title_bar.setStyleSheet("""
+                background-color: #FFFFFF;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                border-bottom: 1px solid #E0E0E0;
+            """)
+            self.title_label.setStyleSheet("color: #212121; font-weight: bold; font-size: 14px;")
+        
         self.setPalette(palette)
-
+        
+        # Modern style sheet
         style = """
+        QWidget {
+            font-family: 'Segoe UI', Arial, sans-serif;
+        }
+        QMainWindow {
+            background-color: palette(window);
+        }
         QFrame {
             border-radius: 8px;
+            background-color: palette(base);
         }
         QPushButton {
             border-radius: 6px;
             padding: 8px 16px;
             font-weight: 500;
+            min-width: 80px;
+            border: 1px solid palette(button);
         }
-        QPushButton:enabled:hover {
+        QPushButton:hover {
             background-color: palette(highlight);
             color: palette(highlightedtext);
         }
-        QPushButton:checked {
+        QPushButton:pressed {
             background-color: palette(highlight);
             color: palette(highlightedtext);
         }
-        QListWidget, QTextEdit {
+        QPushButton:disabled {
+            color: palette(windowText);
+            background-color: palette(window);
+        }
+        QListWidget, QTextEdit, QLineEdit {
             border-radius: 6px;
             padding: 8px;
+            border: 1px solid palette(mid);
+            background-color: palette(base);
         }
         QTabWidget::pane {
             border-radius: 6px;
+            border: 1px solid palette(mid);
         }
-        QComboBox {
-            border-radius: 6px;
-            padding: 4px;
+        QTabBar::tab {
+            padding: 8px 16px;
+            border-radius: 4px;
+            margin-right: 4px;
+        }
+        QTabBar::tab:selected {
+            background-color: palette(highlight);
+            color: palette(highlightedtext);
+        }
+        QProgressBar {
+            border-radius: 4px;
+            border: 1px solid palette(mid);
+            text-align: center;
+        }
+        QProgressBar::chunk {
+            background-color: palette(highlight);
+            border-radius: 4px;
+        }
+        QLabel {
+            font-weight: 500;
         }
         """
         self.setStyleSheet(style)
 
+        # Apply to all widgets
         for widget in self.findChildren(QWidget):
             widget.setPalette(palette)
             widget.style().unpolish(widget)
@@ -869,13 +1067,26 @@ class ServerGUI(QMainWindow):
         self.dark_mode = not self.dark_mode
         self.apply_theme()
 
-    def highlight_button(self, list_widget):
-        for btn in [self.start_btn, self.stop_btn, self.theme_btn]:
-            btn.setChecked(False)
-        if list_widget.selectedItems():
-            btn = self.sender()
-            if btn:
-                btn.setChecked(True)
+    def toggle_maximized(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and event.y() < 40:
+            self.drag_pos = event.globalPos()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if hasattr(self, 'drag_pos'):
+            self.move(self.pos() + event.globalPos() - self.drag_pos)
+            self.drag_pos = event.globalPos()
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if hasattr(self, 'drag_pos'):
+            del self.drag_pos
 
     def start_server(self):
         if not self.server_thread or not self.server_thread.isRunning():
@@ -887,6 +1098,7 @@ class ServerGUI(QMainWindow):
             self.server_thread.start()
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
+            self.statusBar().showMessage("Server started")
 
     def stop_server(self):
         if self.server_thread and self.server_thread.isRunning():
@@ -897,6 +1109,7 @@ class ServerGUI(QMainWindow):
             self.file_list.clear()
             self.stats_display.clear()
             self.user_list.clear()
+            self.statusBar().showMessage("Server stopped")
 
     def update_file_list(self, files):
         self.file_list.clear()
@@ -913,6 +1126,7 @@ class ServerGUI(QMainWindow):
             f"Total Days with Downloads: {stats['total_days_with_downloads']}\n"
             f"Total Files: {stats['total_files']}\n"
             f"Total Storage: {stats['total_storage_gb']:.2f} GB\n"
+            f"Average Transfer Speed: {stats['average_speed']:.2f} MB/s\n"
             f"Files per User: {stats['files_per_user']}\n"
             f"Downloads per User: {stats['downloads_per_user']}\n"
             f"Active Connections: {stats['active_connections']}"
@@ -923,18 +1137,23 @@ class ServerGUI(QMainWindow):
         self.user_list.clear()
         self.user_list.addItems(users)
 
+    # In the ServerGUI class, update the add_user method:
+
     def add_user(self):
-        dialog = UserDialog(self, dark_mode=self.dark_mode)
+        dialog = UserDialog(self)  # Remove the dark_mode parameter
         if dialog.exec_():
-            username, password = dialog.get_credentials()
+            username, password, display_name = dialog.get_credentials()
             if username and password:
                 try:
                     if self.server_thread and self.server_thread.isRunning():
                         with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-                            conn.execute("INSERT INTO users (username, password) VALUES (?, ?)",
-                                       (username, password))
+                            conn.execute("""
+                                INSERT INTO users (username, password, display_name) 
+                                VALUES (?, ?, ?)
+                            """, (username, password, display_name))
                         self.server_thread.user_list_updated.emit(self.server_thread.get_users())
                         self.append_log(f"Added user '{username}'")
+                        self.statusBar().showMessage(f"User '{username}' added successfully")
                     else:
                         raise Exception("Server not running")
                 except sqlite3.IntegrityError:
@@ -947,7 +1166,8 @@ class ServerGUI(QMainWindow):
         if not selected:
             QMessageBox.warning(self, "Warning", "Please select a user to delete.")
             return
-        username = selected[0].text()
+        
+        username = selected[0].text().split(' (')[0]  # Extract username from display
         reply = QMessageBox.question(self, "Confirm", f"Delete user '{username}'?",
                                    QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
@@ -961,6 +1181,7 @@ class ServerGUI(QMainWindow):
                         conn.commit()
                     self.server_thread.user_list_updated.emit(self.server_thread.get_users())
                     self.append_log(f"Deleted user '{username}'")
+                    self.statusBar().showMessage(f"User '{username}' deleted successfully")
                 else:
                     raise Exception("Server not running")
             except Exception as e:
@@ -969,6 +1190,7 @@ class ServerGUI(QMainWindow):
     def append_log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_display.append(f"[{timestamp}] {message}")
+        self.log_display.verticalScrollBar().setValue(self.log_display.verticalScrollBar().maximum())
 
     def closeEvent(self, event):
         if self.server_thread and self.server_thread.isRunning():

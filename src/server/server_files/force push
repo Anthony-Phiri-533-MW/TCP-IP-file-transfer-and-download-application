@@ -1,0 +1,12 @@
+ Option 2: Use the Command Line (More Control)
+If you have write access to the repository, you can force merge using the command line:
+
+bash
+Copy
+Edit
+
+
+git checkout main        # Switch to the main branch
+git pull origin main     # Get the latest changes
+git merge --strategy-option theirs <branch-name>  # Force their changes
+git push origin main     # Push the forced merge
