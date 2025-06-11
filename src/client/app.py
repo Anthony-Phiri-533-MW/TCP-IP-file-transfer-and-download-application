@@ -10,8 +10,8 @@ from watchdog.events import FileSystemEventHandler
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QPushButton, QListWidget, QLineEdit, QLabel, QFileDialog, QMessageBox,
                             QDialog, QFormLayout, QProgressBar, QFrame, QAction, QMenuBar, QCheckBox,
-                            QTabWidget, QInputDialog)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+                            QTabWidget, QInputDialog, QLineEdit as QLineEditBase)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QPalette, QColor, QFont
 from tqdm import tqdm
 
@@ -40,6 +40,8 @@ class FileTransferThread(QThread):
         self.is_logged_in = False
         self.current_file_size = 0
         self.enable_notifications = True
+        self.download_tasks = {}  # {filename: (file, offset, total)}
+        self.paused_downloads = set()
 
     def set_action(self, action, file_names=None, file_paths=None, username=None, password=None, 
                   is_private=False, new_password=None):
@@ -94,6 +96,10 @@ class FileTransferThread(QThread):
                     self.handle_password_change()
                 elif self.action == 'delete_account' and self.is_logged_in:
                     self.handle_delete_account()
+                elif self.action == 'search' and self.is_logged_in:
+                    self.handle_search()
+                elif self.action == 'delete_file' and self.is_logged_in:
+                    self.handle_delete_file()
                 
                 self.action = None
                 while self.running and not self.action:
@@ -149,52 +155,103 @@ class FileTransferThread(QThread):
         self.running = False
 
     def handle_download(self):
-        file_names_str = ','.join(self.file_names)
-        self.client_socket.send(f"DOWNLOAD:{file_names_str}".encode('utf-8'))
-        
         for file_name in self.file_names:
-            response = self.client_socket.recv(1024).decode('utf-8')
-            if response.startswith("Error:"):
-                self.error_occurred.emit(response)
-                continue
+            if file_name in self.paused_downloads:
+                self.resume_download(file_name)
+            else:
+                self.start_download(file_name)
+
+    def start_download(self, file_name):
+        if file_name in self.download_tasks:
+            return  # Already downloading or paused
+        
+        self.client_socket.send(f"DOWNLOAD:{file_name}".encode('utf-8'))
+        response = self.client_socket.recv(1024).decode('utf-8')
+        
+        if response.startswith("Error:"):
+            self.error_occurred.emit(response)
+            return
+            
+        is_zip = False
+        if response.startswith("FILE_SIZE:"):
+            parts = response.split(':')
+            file_size = int(parts[1])
+            offset = 0
+            if len(parts) > 2 and parts[2] == 'ZIP':
+                is_zip = True
                 
-            is_zip = False
-            if response.startswith("FILE_SIZE:"):
-                parts = response.split(':')
-                file_size = int(parts[1])
-                self.current_file_size = file_size
-                if len(parts) > 2 and parts[2] == 'ZIP':
-                    is_zip = True
+            if not os.path.exists(self.download_dir):
+                os.makedirs(self.download_dir)
                 
-                if not os.path.exists(self.download_dir):
-                    os.makedirs(self.download_dir)
-                    
-                file_path = os.path.join(self.download_dir, file_name + ('.zip' if is_zip else ''))
-                received_size = 0
-                
-                try:
-                    with open(file_path, 'wb') as f:
-                        with tqdm(total=file_size, unit='B', unit_scale=True, desc=file_name) as pbar:
-                            while received_size < file_size:
-                                data = self.client_socket.recv(1024)
-                                if not data:
-                                    break
-                                f.write(data)
-                                received_size += len(data)
-                                pbar.update(len(data))
+            file_path = os.path.join(self.download_dir, file_name + ('.zip' if is_zip else ''))
+            received_size = 0
+            
+            try:
+                mode = 'wb' if offset == 0 else 'ab'
+                with open(file_path, mode) as f:
+                    with tqdm(total=file_size, unit='B', unit_scale=True, desc=file_name) as pbar:
+                        while received_size < file_size:
+                            if file_name in self.paused_downloads:
+                                self.download_tasks[file_name] = (f, received_size, file_size)
+                                return
+                            data = self.client_socket.recv(1024)
+                            if not data:
+                                break
+                            f.write(data)
+                            received_size += len(data)
+                            pbar.update(len(data))
                             self.transfer_progress.emit(file_name, received_size, file_size)
                             
-                    if is_zip:
-                        shutil.unpack_archive(file_path, os.path.join(self.download_dir, file_name), 'zip')
-                        os.remove(file_path)
-                    
-                    self.update_status.emit(f"Downloaded '{file_name}' to '{self.download_dir}'")
-                    if self.enable_notifications:
-                        self.notify.emit(f"Download complete: {file_name}")
-                except Exception as e:
-                    self.error_occurred.emit(f"Error saving file: {str(e)}")
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
+                del self.download_tasks[file_name]
+                if is_zip:
+                    shutil.unpack_archive(file_path, os.path.join(self.download_dir, file_name), 'zip')
+                    os.remove(file_path)
+                
+                self.update_status.emit(f"Downloaded '{file_name}' to '{self.download_dir}'")
+                if self.enable_notifications:
+                    self.notify.emit(f"Download complete: {file_name}")
+            except Exception as e:
+                self.error_occurred.emit(f"Error saving file: {str(e)}")
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+
+    def resume_download(self, file_name):
+        if file_name not in self.download_tasks:
+            return
+        
+        f, offset, total = self.download_tasks[file_name]
+        self.client_socket.send(f"DOWNLOAD_RESUME:{file_name}:{offset}".encode('utf-8'))
+        response = self.client_socket.recv(1024).decode('utf-8')
+        
+        if response.startswith("Error:"):
+            self.error_occurred.emit(response)
+            return
+            
+        try:
+            with tqdm(total=total, unit='B', unit_scale=True, desc=file_name, initial=offset) as pbar:
+                while offset < total:
+                    if file_name in self.paused_downloads:
+                        self.download_tasks[file_name] = (f, offset, total)
+                        return
+                    data = self.client_socket.recv(1024)
+                    if not data:
+                        break
+                    f.write(data)
+                    offset += len(data)
+                    pbar.update(len(data))
+                    self.transfer_progress.emit(file_name, offset, total)
+                
+            del self.download_tasks[file_name]
+            self.update_status.emit(f"Resumed and completed '{file_name}'")
+            if self.enable_notifications:
+                self.notify.emit(f"Download resumed and complete: {file_name}")
+        except Exception as e:
+            self.error_occurred.emit(f"Error resuming file: {str(e)}")
+
+    def pause_download(self, file_name):
+        self.paused_downloads.add(file_name)
+        if file_name in self.download_tasks:
+            del self.download_tasks[file_name]
 
     def handle_upload(self):
         for file_path in self.file_paths:
@@ -202,7 +259,6 @@ class FileTransferThread(QThread):
             file_name = os.path.basename(file_path)
             
             if is_folder:
-                # Create zip of folder
                 zip_path = file_path + '.zip'
                 shutil.make_archive(file_path, 'zip', file_path)
                 file_size = os.path.getsize(zip_path)
@@ -255,7 +311,7 @@ class FileTransferThread(QThread):
         self.client_socket.send(f"CHANGE_PASSWORD:{self.new_password}".encode('utf-8'))
         response = self.client_socket.recv(1024).decode('utf-8')
         if response == "Password updated successfully.":
-            self.password = self.new_password  # Update local password
+            self.password = self.new_password
         self.update_status.emit(response)
 
     def handle_delete_account(self):
@@ -266,6 +322,34 @@ class FileTransferThread(QThread):
             self.login_status.emit(False)
             self.running = False
         self.update_status.emit(response)
+
+    def handle_search(self):
+        search_query = ':'.join(self.file_names)  # Assuming file_names contains the search term
+        self.client_socket.send(f"SEARCH:{search_query}".encode('utf-8'))
+        received_data = self.client_socket.recv(4096).decode('utf-8')
+        
+        public_files = []
+        private_files = []
+        
+        if not received_data.startswith("Error:"):
+            parts = received_data.split('|')
+            for part in parts:
+                if part.startswith("PUBLIC:"):
+                    public_files = part.replace("PUBLIC:", "").split(',')
+                elif part.startswith("PRIVATE:"):
+                    private_files = part.replace("PRIVATE:", "").split(',')
+            public_files = [f for f in public_files if f]
+            private_files = [f for f in private_files if f]
+        
+        self.update_file_list.emit(public_files, private_files)
+
+    def handle_delete_file(self):
+        for file_name in self.file_names:
+            self.client_socket.send(f"DELETE_FILE:{file_name}".encode('utf-8'))
+            response = self.client_socket.recv(1024).decode('utf-8')
+            self.update_status.emit(response)
+            if response == f"File '{file_name}' deleted successfully.":
+                self.handle_list_request()
 
     def cleanup_connection(self):
         if self.client_socket:
@@ -417,7 +501,7 @@ class SettingsDialog(QDialog):
         reply = QMessageBox.question(self, "Confirm", "Are you sure you want to delete your account? This action cannot be undone.",
                                    QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
-            self.accept()  # This will trigger the save action with deletion
+            self.accept()
 
     def get_settings(self):
         return {
@@ -435,7 +519,7 @@ class ClientGUI(QMainWindow):
         self.is_logged_in = False
         self.username = None
         self.thread = None
-        self.dark_mode = True  # Start in dark mode by default
+        self.dark_mode = True
         self.sync_observer = None
         self.sync_queue = queue.Queue()
         self.sync_folder = None
@@ -501,8 +585,18 @@ class ClientGUI(QMainWindow):
 
         # Files Tab
         files_tab = QWidget()
-        files_layout = QHBoxLayout(files_tab)
+        files_layout = QVBoxLayout(files_tab)
         files_layout.setContentsMargins(10, 10, 10, 10)
+
+        # Search bar
+        search_layout = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search files...")
+        search_btn = QPushButton("Search")
+        search_btn.clicked.connect(self.search_files)
+        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(search_btn)
+        files_layout.addLayout(search_layout)
 
         # Public files
         public_frame = QFrame()
@@ -523,13 +617,12 @@ class ClientGUI(QMainWindow):
         self.private_file_list = QListWidget()
         self.private_file_list.setSelectionMode(QListWidget.MultiSelection)
         self.private_file_list.setAcceptDrops(True)
-        share_btn = QPushButton("Share Private File")
-        share_btn.clicked.connect(self.share_file)
-        share_btn.setEnabled(False)
-        self.share_btn = share_btn
+        self.share_btn = QPushButton("Share Private File")
+        self.share_btn.clicked.connect(self.share_file)
+        self.share_btn.setEnabled(False)
         private_layout.addWidget(private_label)
         private_layout.addWidget(self.private_file_list)
-        private_layout.addWidget(share_btn)
+        private_layout.addWidget(self.share_btn)
 
         files_layout.addWidget(public_frame)
         files_layout.addWidget(private_frame)
@@ -546,10 +639,20 @@ class ClientGUI(QMainWindow):
         self.download_btn.setEnabled(False)
         self.download_btn.setFixedHeight(40)
         
+        self.pause_btn = QPushButton("Pause Download")
+        self.pause_btn.clicked.connect(self.pause_download)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setFixedHeight(40)
+        
         self.upload_btn = QPushButton("Upload Files/Folders")
         self.upload_btn.clicked.connect(self.upload_files)
         self.upload_btn.setEnabled(False)
         self.upload_btn.setFixedHeight(40)
+        
+        self.delete_btn = QPushButton("Delete Selected")
+        self.delete_btn.clicked.connect(self.delete_files)
+        self.delete_btn.setEnabled(False)
+        self.delete_btn.setFixedHeight(40)
         
         self.refresh_btn = QPushButton("Refresh List")
         self.refresh_btn.clicked.connect(self.refresh_file_list)
@@ -557,7 +660,9 @@ class ClientGUI(QMainWindow):
         self.refresh_btn.setFixedHeight(40)
         
         button_layout.addWidget(self.download_btn)
+        button_layout.addWidget(self.pause_btn)
         button_layout.addWidget(self.upload_btn)
+        button_layout.addWidget(self.delete_btn)
         button_layout.addWidget(self.refresh_btn)
         layout.addWidget(button_frame)
 
@@ -570,7 +675,7 @@ class ClientGUI(QMainWindow):
             palette.setColor(QPalette.Text, QColor("#E0E0E0"))
             palette.setColor(QPalette.Button, QColor("#4A90E2"))
             palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-            palette.setColor(QPalette.Highlight, QColor("#4A90E2"))
+            palette.setColor(QPalette.Highlight, QColor("#FF6B6B"))
             palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
             self.theme_btn.setText("Light Mode")
         else:
@@ -580,7 +685,7 @@ class ClientGUI(QMainWindow):
             palette.setColor(QPalette.Text, QColor("#2C3E50"))
             palette.setColor(QPalette.Button, QColor("#2E7D32"))
             palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-            palette.setColor(QPalette.Highlight, QColor("#2E7D32"))
+            palette.setColor(QPalette.Highlight, QColor("#4CAF50"))
             palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
             self.theme_btn.setText("Dark Mode")
         self.setPalette(palette)
@@ -593,6 +698,14 @@ class ClientGUI(QMainWindow):
             border-radius: 6px;
             padding: 8px 16px;
             font-weight: 500;
+        }
+        QPushButton:enabled:hover {
+            background-color: palette(highlight);
+            color: palette(highlightedtext);
+        }
+        QPushButton:checked {
+            background-color: palette(highlight);
+            color: palette(highlightedtext);
         }
         QListWidget, QTextEdit {
             border-radius: 6px;
@@ -608,7 +721,6 @@ class ClientGUI(QMainWindow):
         """
         self.setStyleSheet(style)
 
-        # Force update all child widgets
         for widget in self.findChildren(QWidget):
             widget.setPalette(palette)
             widget.style().unpolish(widget)
@@ -673,7 +785,6 @@ class ClientGUI(QMainWindow):
             self.sync_observer.schedule(event_handler, folder, recursive=False)
             self.sync_observer.start()
             
-            # Start queue processor
             threading.Thread(target=self.process_sync_queue, daemon=True).start()
             self.update_status(f"Started syncing folder: {folder}")
         else:
@@ -710,6 +821,8 @@ class ClientGUI(QMainWindow):
             self.refresh_btn.setEnabled(True)
             self.settings_btn.setEnabled(True)
             self.share_btn.setEnabled(True)
+            self.delete_btn.setEnabled(True)
+            self.pause_btn.setEnabled(True)
             self.update_status(f"Logged in as {self.username}")
         else:
             self.is_logged_in = False
@@ -729,6 +842,8 @@ class ClientGUI(QMainWindow):
             self.refresh_btn.setEnabled(False)
             self.settings_btn.setEnabled(False)
             self.share_btn.setEnabled(False)
+            self.delete_btn.setEnabled(False)
+            self.pause_btn.setEnabled(False)
             self.public_file_list.clear()
             self.private_file_list.clear()
             self.progress_bar.setVisible(False)
@@ -756,6 +871,11 @@ class ClientGUI(QMainWindow):
         else:
             self.private_file_list.addItems(private_files)
 
+    def search_files(self):
+        search_query = self.search_input.text().strip()
+        if search_query and self.thread and self.thread.isRunning():
+            self.thread.set_action('search', file_names=[search_query])
+
     def download_files(self):
         selected_public = self.public_file_list.selectedItems()
         selected_private = self.private_file_list.selectedItems()
@@ -772,6 +892,21 @@ class ClientGUI(QMainWindow):
             self.progress_bar.setValue(0)
             self.thread.set_action('download', file_names=file_names)
 
+    def pause_download(self):
+        selected_public = self.public_file_list.selectedItems()
+        selected_private = self.private_file_list.selectedItems()
+        selected_items = selected_public + selected_private
+        
+        if not selected_items:
+            QMessageBox.warning(self, "Warning", "Please select a file to pause.")
+            return
+            
+        file_names = [item.text() for item in selected_items if item.text() not in ["No public files available", "No private files available"]]
+        for file_name in file_names:
+            if self.thread and self.thread.isRunning():
+                self.thread.pause_download(file_name)
+                self.update_status(f"Paused download of '{file_name}'")
+
     def upload_files(self):
         dialog = QFileDialog(self)
         dialog.setFileMode(QFileDialog.ExistingFiles | QFileDialog.Directory)
@@ -786,6 +921,22 @@ class ClientGUI(QMainWindow):
                         self.progress_label.setVisible(True)
                         self.progress_bar.setValue(0)
                         self.thread.set_action('upload', file_paths=file_paths, is_private=is_private)
+
+    def delete_files(self):
+        selected_public = self.public_file_list.selectedItems()
+        selected_private = self.private_file_list.selectedItems()
+        selected_items = selected_public + selected_private
+        
+        if not selected_items:
+            QMessageBox.warning(self, "Warning", "Please select files to delete.")
+            return
+            
+        file_names = [item.text() for item in selected_items if item.text() not in ["No public files available", "No private files available"]]
+        if file_names and self.thread and self.thread.isRunning():
+            reply = QMessageBox.question(self, "Confirm", f"Are you sure you want to delete {len(file_names)} file(s)?",
+                                       QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                self.thread.set_action('delete_file', file_names=file_names)
 
     def share_file(self):
         selected = self.private_file_list.selectedItems()
