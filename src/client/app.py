@@ -5,14 +5,16 @@ import time
 import shutil
 import threading
 import queue
+import hashlib
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QPushButton, QListWidget, QLineEdit, QLabel, QFileDialog, QMessageBox,
                             QDialog, QFormLayout, QProgressBar, QFrame, QAction, QMenuBar, QCheckBox,
-                            QTabWidget, QInputDialog, QLineEdit as QLineEditBase)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QPalette, QColor, QFont
+                            QTabWidget, QInputDialog, QLineEdit as QLineEditBase, QGraphicsDropShadowEffect,
+                            QStatusBar, QSizeGrip)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QPropertyAnimation
+from PyQt5.QtGui import QPalette, QColor, QFont, QIcon, QCursor
 from tqdm import tqdm
 
 class FileTransferThread(QThread):
@@ -20,8 +22,9 @@ class FileTransferThread(QThread):
     update_file_list = pyqtSignal(list, list)  # public_files, private_files
     error_occurred = pyqtSignal(str)
     login_status = pyqtSignal(bool)
-    transfer_progress = pyqtSignal(str, int, int)  # filename, current, total
+    transfer_progress = pyqtSignal(str, int, int, float)  # filename, current, total, speed
     notify = pyqtSignal(str)  # For notifications
+    display_name_received = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -34,17 +37,21 @@ class FileTransferThread(QThread):
         self.username = None
         self.password = None
         self.new_password = None
+        self.display_name = None
         self.download_dir = 'downloads'
-        self.host = socket.gethostname()
-        self.port = 1253
+        self.host = None
+        self.port = 1253  # Default port
         self.is_logged_in = False
         self.current_file_size = 0
         self.enable_notifications = True
         self.download_tasks = {}  # {filename: (file, offset, total)}
         self.paused_downloads = set()
+        self.last_transfer_update = 0
+        self.last_bytes_transferred = 0
+        self.transfer_speed = 0.0
 
     def set_action(self, action, file_names=None, file_paths=None, username=None, password=None, 
-                  is_private=False, new_password=None):
+                  is_private=False, new_password=None, display_name=None):
         self.action = action
         self.file_names = file_names if file_names else []
         self.file_paths = file_paths if file_paths else []
@@ -52,6 +59,7 @@ class FileTransferThread(QThread):
         self.password = password
         self.is_private = is_private
         self.new_password = new_password
+        self.display_name = display_name
 
     def set_notifications(self, enabled):
         self.enable_notifications = enabled
@@ -63,6 +71,7 @@ class FileTransferThread(QThread):
             self.running = True
             self.update_status.emit("Connected to server.")
             
+            # Test connection
             self.client_socket.settimeout(2.0)
             try:
                 self.client_socket.recv(1024)
@@ -73,6 +82,17 @@ class FileTransferThread(QThread):
         except Exception as e:
             self.error_occurred.emit(f"Connection error: {str(e)}")
             return False
+
+    def calculate_speed(self, bytes_transferred):
+        now = time.time()
+        if self.last_transfer_update > 0:
+            time_diff = now - self.last_transfer_update
+            if time_diff > 0:
+                bytes_diff = bytes_transferred - self.last_bytes_transferred
+                self.transfer_speed = (bytes_diff / (1024 * 1024)) / time_diff  # MB/s
+        self.last_transfer_update = now
+        self.last_bytes_transferred = bytes_transferred
+        return self.transfer_speed
 
     def run(self):
         if not self.connect_to_server():
@@ -100,6 +120,10 @@ class FileTransferThread(QThread):
                     self.handle_search()
                 elif self.action == 'delete_file' and self.is_logged_in:
                     self.handle_delete_file()
+                elif self.action == 'get_display_name' and self.is_logged_in:
+                    self.handle_get_display_name()
+                elif self.action == 'update_display_name' and self.is_logged_in:
+                    self.handle_update_display_name()
                 
                 self.action = None
                 while self.running and not self.action:
@@ -142,6 +166,7 @@ class FileTransferThread(QThread):
             self.login_status.emit(True)
             self.update_status.emit(response)
             self.handle_list_request()
+            self.handle_get_display_name()  # Get display name after login
         else:
             self.error_occurred.emit(response)
             self.login_status.emit(False)
@@ -163,90 +188,98 @@ class FileTransferThread(QThread):
 
     def start_download(self, file_name):
         if file_name in self.download_tasks:
-            return  # Already downloading or paused
-        
-        self.client_socket.send(f"DOWNLOAD:{file_name}".encode('utf-8'))
-        response = self.client_socket.recv(1024).decode('utf-8')
-        
-        if response.startswith("Error:"):
-            self.error_occurred.emit(response)
             return
-            
-        is_zip = False
-        if response.startswith("FILE_SIZE:"):
-            parts = response.split(':')
-            file_size = int(parts[1])
-            offset = 0
-            if len(parts) > 2 and parts[2] == 'ZIP':
-                is_zip = True
-                
-            if not os.path.exists(self.download_dir):
-                os.makedirs(self.download_dir)
-                
-            file_path = os.path.join(self.download_dir, file_name + ('.zip' if is_zip else ''))
-            received_size = 0
-            
-            try:
-                mode = 'wb' if offset == 0 else 'ab'
-                with open(file_path, mode) as f:
-                    with tqdm(total=file_size, unit='B', unit_scale=True, desc=file_name) as pbar:
-                        while received_size < file_size:
-                            if file_name in self.paused_downloads:
-                                self.download_tasks[file_name] = (f, received_size, file_size)
-                                return
-                            data = self.client_socket.recv(1024)
-                            if not data:
-                                break
-                            f.write(data)
-                            received_size += len(data)
-                            pbar.update(len(data))
-                            self.transfer_progress.emit(file_name, received_size, file_size)
-                            
-                del self.download_tasks[file_name]
-                if is_zip:
-                    shutil.unpack_archive(file_path, os.path.join(self.download_dir, file_name), 'zip')
-                    os.remove(file_path)
-                
-                self.update_status.emit(f"Downloaded '{file_name}' to '{self.download_dir}'")
-                if self.enable_notifications:
-                    self.notify.emit(f"Download complete: {file_name}")
-            except Exception as e:
-                self.error_occurred.emit(f"Error saving file: {str(e)}")
-                if os.path.exists(file_path):
-                    os.remove(file_path)
 
-    def resume_download(self, file_name):
-        if file_name not in self.download_tasks:
-            return
-        
-        f, offset, total = self.download_tasks[file_name]
-        self.client_socket.send(f"DOWNLOAD_RESUME:{file_name}:{offset}".encode('utf-8'))
-        response = self.client_socket.recv(1024).decode('utf-8')
-        
-        if response.startswith("Error:"):
-            self.error_occurred.emit(response)
-            return
-            
+        self.client_socket.send(f"DOWNLOAD:{file_name}".encode('utf-8'))
+
+        # Flush buffer carefully until we find the correct header
+        header = b""
+        while b"\n" not in header:
+            chunk = self.client_socket.recv(1024)
+            if not chunk:
+                self.error_occurred.emit("Error: Server closed connection unexpectedly")
+                return
+            header += chunk
+
         try:
-            with tqdm(total=total, unit='B', unit_scale=True, desc=file_name, initial=offset) as pbar:
-                while offset < total:
-                    if file_name in self.paused_downloads:
-                        self.download_tasks[file_name] = (f, offset, total)
-                        return
-                    data = self.client_socket.recv(1024)
-                    if not data:
-                        break
-                    f.write(data)
-                    offset += len(data)
-                    pbar.update(len(data))
-                    self.transfer_progress.emit(file_name, offset, total)
-                
-            del self.download_tasks[file_name]
-            self.update_status.emit(f"Resumed and completed '{file_name}'")
-            if self.enable_notifications:
-                self.notify.emit(f"Download resumed and complete: {file_name}")
+            header_line, remaining_data = header.split(b"\n", 1)
+            header_str = header_line.decode('utf-8').strip()
         except Exception as e:
-            self.error_occurred.emit(f"Error resuming file: {str(e)}")
+            self.error_occurred.emit(f"Header decode failed: {str(e)}")
+            return
+
+        # Validate header
+        if not header_str.startswith("FILE_SIZE:"):
+            # Scan for valid header inside corrupted buffer
+            index = header.find(b"FILE_SIZE:")
+            if index != -1:
+                try:
+                    header = header[index:]
+                    header_line, remaining_data = header.split(b"\n", 1)
+                    header_str = header_line.decode('utf-8').strip()
+                except Exception as e:
+                    self.error_occurred.emit(f"Recovered header failed: {str(e)}")
+                    return
+            else:
+                self.error_occurred.emit(f"Error: Invalid header format - {header_str}")
+                return
+
+        # Parse file size and zip flag
+        parts = header_str.split(':')
+        try:
+            file_size = int(parts[1])
+            is_zip = len(parts) > 2 and parts[2] == "ZIP"
+        except Exception as e:
+            self.error_occurred.emit(f"Error parsing header: {header_str}")
+            return
+
+        # Create output path
+        if not os.path.exists(self.download_dir):
+            os.makedirs(self.download_dir)
+
+        file_path = os.path.join(self.download_dir, file_name + ('.zip' if is_zip else ''))
+        received_size = len(remaining_data)
+
+        try:
+            with open(file_path, 'wb') as f:
+                f.write(remaining_data)
+                with tqdm(total=file_size, unit='B', unit_scale=True, desc=file_name, initial=received_size) as pbar:
+                    self.last_transfer_update = time.time()
+                    self.last_bytes_transferred = received_size
+
+                    while received_size < file_size:
+                        if file_name in self.paused_downloads:
+                            self.download_tasks[file_name] = (f, received_size, file_size)
+                            return
+
+                        data = self.client_socket.recv(min(4096, file_size - received_size))
+                        if not data:
+                            break
+
+                        f.write(data)
+                        received_size += len(data)
+                        pbar.update(len(data))
+                        speed = self.calculate_speed(received_size)
+                        self.transfer_progress.emit(file_name, received_size, file_size, speed)
+
+            if file_name in self.download_tasks:
+                del self.download_tasks[file_name]
+
+            if is_zip:
+                extract_dir = os.path.join(self.download_dir, file_name)
+                shutil.unpack_archive(file_path, extract_dir, 'zip')
+                os.remove(file_path)
+
+            self.update_status.emit(f"Downloaded '{file_name}' to '{self.download_dir}'")
+            if self.enable_notifications:
+                self.notify.emit(f"Download complete: {file_name}")
+
+        except Exception as e:
+            self.error_occurred.emit(f"Error saving file: {str(e)}")
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+
 
     def pause_download(self, file_name):
         self.paused_downloads.add(file_name)
@@ -258,46 +291,68 @@ class FileTransferThread(QThread):
             is_folder = os.path.isdir(file_path)
             file_name = os.path.basename(file_path)
             
-            if is_folder:
-                zip_path = file_path + '.zip'
-                shutil.make_archive(file_path, 'zip', file_path)
-                file_size = os.path.getsize(zip_path)
-            else:
-                if not os.path.isfile(file_path):
-                    self.error_occurred.emit(f"File '{file_path}' not found.")
-                    continue
-                file_size = os.path.getsize(file_path)
-            
-            self.current_file_size = file_size
-            is_private = 1 if self.is_private else 0
-            is_folder_flag = 1 if is_folder else 0
-            self.client_socket.send(f"UPLOAD:{file_name}:{file_size}:{is_private}:{is_folder_flag}".encode('utf-8'))
-            
             try:
-                source_path = zip_path if is_folder else file_path
-                with open(source_path, 'rb') as f:
-                    with tqdm(total=file_size, unit='B', unit_scale=True, desc=file_name) as pbar:
-                        bytes_sent = 0
-                        while True:
-                            data = f.read(1024)
-                            if not data:
-                                break
-                            self.client_socket.sendall(data)
-                            bytes_sent += len(data)
-                            pbar.update(len(data))
-                            self.transfer_progress.emit(file_name, bytes_sent, file_size)
-                        
                 if is_folder:
-                    os.remove(zip_path)
+                    # Create temp zip file
+                    temp_zip = file_path + '.temp.zip'
+                    shutil.make_archive(file_path, 'zip', file_path)
+                    os.rename(file_path + '.zip', temp_zip)
+                    file_size = os.path.getsize(temp_zip)
+                else:
+                    if not os.path.isfile(file_path):
+                        self.error_occurred.emit(f"File '{file_path}' not found.")
+                        continue
+                    file_size = os.path.getsize(file_path)
                 
-                response = self.client_socket.recv(1024).decode('utf-8')
-                self.update_status.emit(response)
-                if self.enable_notifications:
-                    self.notify.emit(f"Upload complete: {file_name}")
+                self.current_file_size = file_size
+                is_private = 1 if self.is_private else 0
+                is_folder_flag = 1 if is_folder else 0
                 
-                self.handle_list_request()
+                # Send metadata first
+                self.client_socket.send(f"UPLOAD:{file_name}:{file_size}:{is_private}:{is_folder_flag}".encode('utf-8'))
+                
+                try:
+                    source_path = temp_zip if is_folder else file_path
+                    start_time = time.time()
+                    self.last_transfer_update = start_time
+                    self.last_bytes_transferred = 0
+                    
+                    with open(source_path, 'rb') as f:
+                        bytes_sent = 0
+                        while bytes_sent < file_size:
+                            chunk = f.read(min(4096, file_size - bytes_sent))
+                            if not chunk:
+                                break
+                            self.client_socket.sendall(chunk)
+                            bytes_sent += len(chunk)
+                            speed = self.calculate_speed(bytes_sent)
+                            self.transfer_progress.emit(file_name, bytes_sent, file_size, speed)
+                    
+                    # Verify complete transfer
+                    if bytes_sent != file_size:
+                        raise Exception(f"Upload incomplete. Sent {bytes_sent} of {file_size} bytes")
+                    
+                    transfer_time = time.time() - start_time
+                    speed = (file_size / (1024 * 1024)) / transfer_time if transfer_time > 0 else 0  # MB/s
+                    
+                    # Clean up temp files
+                    if is_folder and os.path.exists(temp_zip):
+                        os.remove(temp_zip)
+                    
+                    # Get server response
+                    response = self.client_socket.recv(1024).decode('utf-8')
+                    self.update_status.emit(f"{response} (Speed: {speed:.2f} MB/s)")
+                    if self.enable_notifications:
+                        self.notify.emit(f"Upload complete: {file_name}")
+                    
+                    self.handle_list_request()
+                except Exception as e:
+                    self.error_occurred.emit(f"Error uploading file: {str(e)}")
+                    # Clean up temp files on error
+                    if is_folder and os.path.exists(temp_zip):
+                        os.remove(temp_zip)
             except Exception as e:
-                self.error_occurred.emit(f"Error uploading file: {str(e)}")
+                self.error_occurred.emit(f"Error preparing upload: {str(e)}")
 
     def handle_share(self):
         file_name, target_user = self.file_names
@@ -351,6 +406,19 @@ class FileTransferThread(QThread):
             if response == f"File '{file_name}' deleted successfully.":
                 self.handle_list_request()
 
+    def handle_get_display_name(self):
+        self.client_socket.send(f"GET_DISPLAY_NAME:{self.username}".encode('utf-8'))
+        response = self.client_socket.recv(1024).decode('utf-8')
+        self.display_name = response
+        self.display_name_received.emit(response)
+
+    def handle_update_display_name(self):
+        self.client_socket.send(f"UPDATE_DISPLAY_NAME:{self.display_name}".encode('utf-8'))
+        response = self.client_socket.recv(1024).decode('utf-8')
+        self.update_status.emit(response)
+        if response == "Display name updated successfully.":
+            self.handle_get_display_name()
+
     def cleanup_connection(self):
         if self.client_socket:
             try:
@@ -375,223 +443,372 @@ class SyncHandler(FileSystemEventHandler):
         if not event.is_directory:
             self.queue.put(('upload', event.src_path))
 
-class LoginDialog(QDialog):
-    def __init__(self, parent=None, dark_mode=False):
-        super().__init__(parent)
-        self.dark_mode = dark_mode
-        self.setWindowTitle("Login")
-        self.setMinimumWidth(300)
+class LoginScreen(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("File Transfer Client - Login")
+        self.setFixedSize(400, 350)
         self.init_ui()
-        self.apply_theme()
 
     def init_ui(self):
-        layout = QFormLayout()
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f5f7fa;
+            }
+            QLabel {
+                color: #333333;
+            }
+            QLineEdit {
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                padding: 8px;
+                background-color: white;
+                color: #333333;
+            }
+            QPushButton {
+                background-color: #4a6fa5;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #3a5a8f;
+            }
+        """)
+
+        layout = QVBoxLayout()
+        
+        header = QLabel("File Transfer Client")
+        header.setStyleSheet("font-size: 20px; font-weight: bold; margin-bottom: 20px;")
+        layout.addWidget(header)
+        
+        form_layout = QFormLayout()
+        
+        self.server_ip_input = QLineEdit()
+        self.server_ip_input.setPlaceholderText("Server IP (e.g., 127.0.0.1)")
+        
+        self.server_port_input = QLineEdit()
+        self.server_port_input.setPlaceholderText("Port (e.g., 1253)")
+        self.server_port_input.setText("1253")
         
         self.username_input = QLineEdit()
-        self.username_input.setPlaceholderText("Enter username")
+        self.username_input.setPlaceholderText("Username")
         
         self.password_input = QLineEdit()
-        self.password_input.setPlaceholderText("Enter password")
+        self.password_input.setPlaceholderText("Password")
         self.password_input.setEchoMode(QLineEdit.Password)
         
-        layout.addRow("Username:", self.username_input)
-        layout.addRow("Password:", self.password_input)
+        form_layout.addRow("Server IP:", self.server_ip_input)
+        form_layout.addRow("Port:", self.server_port_input)
+        form_layout.addRow("Username:", self.username_input)
+        form_layout.addRow("Password:", self.password_input)
         
         buttons = QHBoxLayout()
-        ok_btn = QPushButton("OK")
-        ok_btn.clicked.connect(self.accept)
-        cancel_btn = QPushButton("Cancel")
+        login_btn = QPushButton("Login")
+        login_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Exit")
         cancel_btn.clicked.connect(self.reject)
-        buttons.addWidget(ok_btn)
+        buttons.addWidget(login_btn)
         buttons.addWidget(cancel_btn)
         
-        layout.addRow(buttons)
+        layout.addLayout(form_layout)
+        layout.addLayout(buttons)
         self.setLayout(layout)
-
-    def apply_theme(self):
-        palette = self.palette()
-        if self.dark_mode:
-            palette.setColor(QPalette.Window, QColor("#1E1E2F"))
-            palette.setColor(QPalette.WindowText, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Base, QColor("#1E1E2F"))
-            palette.setColor(QPalette.Text, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Button, QColor("#4A90E2"))
-            palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-        else:
-            palette.setColor(QPalette.Window, QColor("#F5F7FA"))
-            palette.setColor(QPalette.WindowText, QColor("#2C3E50"))
-            palette.setColor(QPalette.Base, QColor("#F5F7FA"))
-            palette.setColor(QPalette.Text, QColor("#2C3E50"))
-            palette.setColor(QPalette.Button, QColor("#2E7D32"))
-            palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-        self.setPalette(palette)
 
     def get_credentials(self):
-        return self.username_input.text().strip(), self.password_input.text().strip()
+        server_ip = self.server_ip_input.text().strip()
+        server_port = self.server_port_input.text().strip()
+        username = self.username_input.text().strip()
+        password = self.password_input.text().strip()
+        return (server_ip, server_port, username, password)
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None, dark_mode=False):
+    def __init__(self, parent, dark_mode=False):
         super().__init__(parent)
-        self.dark_mode = dark_mode
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(400)
+        self.setFixedSize(400, 300)
+        self.dark_mode = dark_mode
         self.init_ui()
-        self.apply_theme()
 
     def init_ui(self):
-        layout = QFormLayout()
-        
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f5f7fa;
+            }
+            QLabel {
+                color: #333333;
+            }
+            QLineEdit {
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                padding: 8px;
+                background-color: white;
+                color: #333333;
+            }
+            QPushButton {
+                background-color: #4a6fa5;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #3a5a8f;
+            }
+            QCheckBox {
+                color: #333333;
+                padding: 5px;
+            }
+        """)
+
+        layout = QVBoxLayout()
+
+        # Theme toggle
+        self.theme_cb = QCheckBox("Enable Dark Mode")
+        self.theme_cb.setChecked(self.dark_mode)
+        layout.addWidget(self.theme_cb)
+
+        # Password change
         self.password_input = QLineEdit()
-        self.password_input.setPlaceholderText("Enter new password")
+        self.password_input.setPlaceholderText("New Password")
         self.password_input.setEchoMode(QLineEdit.Password)
-        
-        self.sync_folder_input = QLineEdit()
-        self.sync_folder_input.setPlaceholderText("Select sync folder")
-        self.sync_folder_input.setReadOnly(True)
-        sync_btn = QPushButton("Browse")
-        sync_btn.clicked.connect(self.select_sync_folder)
-        
-        self.notify_check = QCheckBox("Enable notifications for transfers and shares")
-        self.notify_check.setChecked(True)
-        
-        self.delete_account_btn = QPushButton("Delete My Account")
-        self.delete_account_btn.clicked.connect(self.delete_account)
-        
-        layout.addRow("New Password:", self.password_input)
-        layout.addRow("Sync Folder:", self.sync_folder_input)
-        layout.addRow("", sync_btn)
-        layout.addRow("Notifications:", self.notify_check)
-        layout.addRow("", self.delete_account_btn)
-        
+        layout.addWidget(QLabel("Change Password:"))
+        layout.addWidget(self.password_input)
+
+        # Sync folder
+        self.sync_input = QLineEdit()
+        self.sync_input.setPlaceholderText("Sync Folder Path")
+        self.sync_btn = QPushButton("Browse")
+        self.sync_btn.clicked.connect(self.browse_folder)
+        sync_layout = QHBoxLayout()
+        sync_layout.addWidget(self.sync_input)
+        sync_layout.addWidget(self.sync_btn)
+        layout.addWidget(QLabel("Sync Folder:"))
+        layout.addLayout(sync_layout)
+
+        # Notifications
+        self.notify_cb = QCheckBox("Enable Notifications")
+        self.notify_cb.setChecked(True)
+        layout.addWidget(self.notify_cb)
+
+        # Delete account
+        self.delete_cb = QCheckBox("Delete Account")
+        layout.addWidget(self.delete_cb)
+
+        # Display name
+        self.display_name_input = QLineEdit()
+        self.display_name_input.setPlaceholderText("New Display Name")
+        layout.addWidget(QLabel("Change Display Name:"))
+        layout.addWidget(self.display_name_input)
+
+        # Buttons
         buttons = QHBoxLayout()
-        ok_btn = QPushButton("Save")
-        ok_btn.clicked.connect(self.accept)
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        buttons.addWidget(ok_btn)
+        buttons.addWidget(save_btn)
         buttons.addWidget(cancel_btn)
-        
-        layout.addRow(buttons)
+        layout.addLayout(buttons)
+
         self.setLayout(layout)
 
-    def apply_theme(self):
-        palette = self.palette()
-        if self.dark_mode:
-            palette.setColor(QPalette.Window, QColor("#1E1E2F"))
-            palette.setColor(QPalette.WindowText, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Base, QColor("#1E1E2F"))
-            palette.setColor(QPalette.Text, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Button, QColor("#4A90E2"))
-            palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-        else:
-            palette.setColor(QPalette.Window, QColor("#F5F7FA"))
-            palette.setColor(QPalette.WindowText, QColor("#2C3E50"))
-            palette.setColor(QPalette.Base, QColor("#F5F7FA"))
-            palette.setColor(QPalette.Text, QColor("#2C3E50"))
-            palette.setColor(QPalette.Button, QColor("#2E7D32"))
-            palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-        self.setPalette(palette)
-
-    def select_sync_folder(self):
+    def browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Sync Folder")
         if folder:
-            self.sync_folder_input.setText(folder)
-
-    def delete_account(self):
-        reply = QMessageBox.question(self, "Confirm", "Are you sure you want to delete your account? This action cannot be undone.",
-                                   QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            self.accept()
+            self.sync_input.setText(folder)
 
     def get_settings(self):
         return {
-            'password': self.password_input.text().strip(),
-            'sync_folder': self.sync_folder_input.text().strip(),
-            'notifications': self.notify_check.isChecked(),
-            'delete_account': self.delete_account_btn.isEnabled() and self.delete_account_btn.text() == "Delete My Account"
+            'dark_mode': self.theme_cb.isChecked(),
+            'password': self.password_input.text().strip() if self.password_input.text().strip() else None,
+            'sync_folder': self.sync_input.text().strip() if self.sync_input.text().strip() else None,
+            'notifications': self.notify_cb.isChecked(),
+            'delete_account': self.delete_cb.isChecked(),
+            'display_name': self.display_name_input.text().strip() if self.display_name_input.text().strip() else None
         }
 
 class ClientGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("File Transfer Client")
-        self.setGeometry(100, 100, 800, 600)
+        self.setGeometry(100, 100, 900, 700)
         self.is_logged_in = False
         self.username = None
+        self.display_name = None
         self.thread = None
-        self.dark_mode = True
         self.sync_observer = None
         self.sync_queue = queue.Queue()
         self.sync_folder = None
+        self.dark_mode = False
         self.init_ui()
-        self.apply_theme()
-        self.setAcceptDrops(True)
 
     def init_ui(self):
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f7fa;
+            }
+            QFrame {
+                background-color: white;
+                border-radius: 8px;
+                border: 1px solid #e0e0e0;
+            }
+            QPushButton {
+                background-color: #4a6fa5;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 8px 16px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background-color: #3a5a8f;
+            }
+            QPushButton:pressed {
+                background-color: #2a4a7f;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+            }
+            QListWidget, QTextEdit, QLineEdit {
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                padding: 8px;
+                background-color: white;
+                color: #333333;
+            }
+            QTabWidget::pane {
+                border: 1px solid #e0e0e0;
+                border-radius: 8px;
+            }
+            QTabBar::tab {
+                padding: 8px 16px;
+                background-color: #e0e0e0;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                margin-right: 4px;
+            }
+            QTabBar::tab:selected {
+                background-color: white;
+                border-bottom: 2px solid #4a6fa5;
+            }
+            QLabel {
+                color: #333333;
+            }
+            QProgressBar {
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                text-align: center;
+                background-color: white;
+            }
+            QProgressBar::chunk {
+                background-color: #4a6fa5;
+                border-radius: 4px;
+            }
+        """)
+
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        layout = QVBoxLayout(central_widget)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
+        self.main_layout = QVBoxLayout(central_widget)
+        self.main_layout.setContentsMargins(20, 20, 20, 20)
+        self.main_layout.setSpacing(15)
+
+        # Header
+        self.header_label = QLabel("File Transfer Client")
+        self.header_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+        self.main_layout.addWidget(self.header_label)
+
+        # Status label
+        self.status_label = QLabel("Status: Ready")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.main_layout.addWidget(self.status_label)
+
+        # Status bar
+        self.statusBar().showMessage("Ready")
+        self.statusBar().setStyleSheet("""
+            QStatusBar {
+                border-top: 1px solid palette(mid);
+            }
+        """)
+
+        # Show login screen first
+        self.show_login_screen()
+
+    def show_login_screen(self):
+        login = LoginScreen()
+        if login.exec_() == QDialog.Accepted:
+            server_ip, server_port, username, password = login.get_credentials()
+            if username and password and server_ip and server_port:
+                try:
+                    port = int(server_port)  # Convert port to integer
+                    self.start_transfer_thread(server_ip, port)
+                    self.thread.set_action('login', username=username, password=password)
+                except ValueError:
+                    QMessageBox.warning(self, "Error", "Invalid port number")
+                    self.show_login_screen()
+            else:
+                QMessageBox.warning(self, "Error", "Server IP, port, username, and password are required")
+                self.show_login_screen()
+        else:
+            self.close()
+
+    def show_main_ui(self):
+        # Clear existing widgets from main_layout, preserving header and status label
+        while self.main_layout.count() > 2:  # Keep header and status label
+            item = self.main_layout.takeAt(2)
+            if item.widget():
+                item.widget().setParent(None)
 
         # Account controls
         account_frame = QFrame()
-        account_frame.setFrameShape(QFrame.StyledPanel)
         account_layout = QHBoxLayout(account_frame)
-        account_layout.setContentsMargins(10, 10, 10, 10)
-        
-        self.login_btn = QPushButton("Login")
-        self.login_btn.clicked.connect(self.show_login_dialog)
-        self.login_btn.setFixedHeight(40)
         
         self.logout_btn = QPushButton("Logout")
         self.logout_btn.clicked.connect(self.logout)
         self.logout_btn.setFixedHeight(40)
         self.logout_btn.setEnabled(False)
         
-        self.theme_btn = QPushButton("Light Mode")
-        self.theme_btn.clicked.connect(self.toggle_theme)
-        self.theme_btn.setFixedHeight(40)
-        
         self.settings_btn = QPushButton("Settings")
         self.settings_btn.clicked.connect(self.show_settings_dialog)
         self.settings_btn.setFixedHeight(40)
         self.settings_btn.setEnabled(False)
         
-        account_layout.addWidget(self.login_btn)
         account_layout.addWidget(self.logout_btn)
-        account_layout.addWidget(self.theme_btn)
         account_layout.addWidget(self.settings_btn)
-        layout.addWidget(account_frame)
-
-        # Status label
-        self.status_label = QLabel("Status: Ready to connect")
-        self.status_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.status_label)
+        account_layout.addStretch()
+        self.main_layout.addWidget(account_frame)
 
         # Progress bar
         self.progress_label = QLabel("Transfer Progress:")
         self.progress_label.setVisible(False)
-        layout.addWidget(self.progress_label)
+        self.main_layout.addWidget(self.progress_label)
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setFixedHeight(8)
-        layout.addWidget(self.progress_bar)
+        self.main_layout.addWidget(self.progress_bar)
+        
+        self.speed_label = QLabel("Speed: 0.00 MB/s")
+        self.speed_label.setVisible(False)
+        self.speed_label.setAlignment(Qt.AlignRight)
+        self.main_layout.addWidget(self.speed_label)
 
         # Tabs
         tabs = QTabWidget()
-        layout.addWidget(tabs)
+        self.main_layout.addWidget(tabs)
 
         # Files Tab
         files_tab = QWidget()
         files_layout = QVBoxLayout(files_tab)
-        files_layout.setContentsMargins(10, 10, 10, 10)
 
         # Search bar
         search_layout = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search files...")
+        self.search_input.returnPressed.connect(self.search_files)
         search_btn = QPushButton("Search")
         search_btn.clicked.connect(self.search_files)
         search_layout.addWidget(self.search_input)
@@ -601,135 +818,187 @@ class ClientGUI(QMainWindow):
         # Public files
         public_frame = QFrame()
         public_layout = QVBoxLayout(public_frame)
-        public_label = QLabel("Public Files: (Drag and drop here to upload public files)")
+        public_label = QLabel("Public Files")
         public_label.setStyleSheet("font-weight: bold;")
         self.public_file_list = QListWidget()
-        self.public_file_list.setSelectionMode(QListWidget.MultiSelection)
-        self.public_file_list.setAcceptDrops(True)
+        self.public_file_list.setSelectionMode(QListWidget.ExtendedSelection)
         public_layout.addWidget(public_label)
         public_layout.addWidget(self.public_file_list)
+        files_layout.addWidget(public_frame)
 
         # Private files
         private_frame = QFrame()
         private_layout = QVBoxLayout(private_frame)
-        private_label = QLabel("Private Files: (Drag and drop here to upload private files)")
+        private_label = QLabel("Private Files")
         private_label.setStyleSheet("font-weight: bold;")
         self.private_file_list = QListWidget()
-        self.private_file_list.setSelectionMode(QListWidget.MultiSelection)
-        self.private_file_list.setAcceptDrops(True)
+        self.private_file_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.share_btn = QPushButton("Share Private File")
         self.share_btn.clicked.connect(self.share_file)
         self.share_btn.setEnabled(False)
         private_layout.addWidget(private_label)
         private_layout.addWidget(self.private_file_list)
         private_layout.addWidget(self.share_btn)
-
-        files_layout.addWidget(public_frame)
         files_layout.addWidget(private_frame)
+
+        files_layout.addStretch()
         tabs.addTab(files_tab, "Files")
 
         # Action buttons
         button_frame = QFrame()
-        button_frame.setFrameShape(QFrame.StyledPanel)
         button_layout = QHBoxLayout(button_frame)
-        button_layout.setContentsMargins(10, 10, 10, 10)
         
         self.download_btn = QPushButton("Download Selected")
         self.download_btn.clicked.connect(self.download_files)
-        self.download_btn.setEnabled(False)
         self.download_btn.setFixedHeight(40)
+        self.download_btn.setEnabled(False)
         
         self.pause_btn = QPushButton("Pause Download")
         self.pause_btn.clicked.connect(self.pause_download)
-        self.pause_btn.setEnabled(False)
         self.pause_btn.setFixedHeight(40)
+        self.pause_btn.setEnabled(False)
         
         self.upload_btn = QPushButton("Upload Files/Folders")
         self.upload_btn.clicked.connect(self.upload_files)
-        self.upload_btn.setEnabled(False)
         self.upload_btn.setFixedHeight(40)
+        self.upload_btn.setEnabled(False)
         
         self.delete_btn = QPushButton("Delete Selected")
         self.delete_btn.clicked.connect(self.delete_files)
-        self.delete_btn.setEnabled(False)
         self.delete_btn.setFixedHeight(40)
+        self.delete_btn.setEnabled(False)
         
         self.refresh_btn = QPushButton("Refresh List")
         self.refresh_btn.clicked.connect(self.refresh_file_list)
-        self.refresh_btn.setEnabled(False)
         self.refresh_btn.setFixedHeight(40)
+        self.refresh_btn.setEnabled(False)
         
         button_layout.addWidget(self.download_btn)
         button_layout.addWidget(self.pause_btn)
         button_layout.addWidget(self.upload_btn)
         button_layout.addWidget(self.delete_btn)
         button_layout.addWidget(self.refresh_btn)
-        layout.addWidget(button_frame)
+        self.main_layout.addWidget(button_frame)
+
+        self.header_label.setText(f"Welcome, {self.display_name or self.username}")
 
     def apply_theme(self):
-        palette = self.palette()
+        palette = QPalette()
         if self.dark_mode:
-            palette.setColor(QPalette.Window, QColor("#1E1E2F"))
+            palette.setColor(QPalette.Window, QColor("#121212"))
             palette.setColor(QPalette.WindowText, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Base, QColor("#1E1E2F"))
-            palette.setColor(QPalette.Text, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Button, QColor("#4A90E2"))
+            palette.setColor(QPalette.Base, QColor("#1E1E1E"))
+            palette.setColor(QPalette.AlternateBase, QColor("#2D2D2D"))
+            palette.setColor(QPalette.Text, QColor("#FFFFFF"))
+            palette.setColor(QPalette.Button, QColor("#333333"))
             palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-            palette.setColor(QPalette.Highlight, QColor("#FF6B6B"))
-            palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
-            self.theme_btn.setText("Light Mode")
+            palette.setColor(QPalette.Highlight, QColor("#BB86FC"))
+            palette.setColor(QPalette.HighlightedText, QColor("#000000"))
+            palette.setColor(QPalette.ToolTipBase, QColor("#BB86FC"))
+            palette.setColor(QPalette.ToolTipText, QColor("#000000"))
         else:
-            palette.setColor(QPalette.Window, QColor("#F5F7FA"))
-            palette.setColor(QPalette.WindowText, QColor("#2C3E50"))
-            palette.setColor(QPalette.Base, QColor("#F5F7FA"))
-            palette.setColor(QPalette.Text, QColor("#2C3E50"))
-            palette.setColor(QPalette.Button, QColor("#2E7D32"))
-            palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-            palette.setColor(QPalette.Highlight, QColor("#4CAF50"))
+            palette.setColor(QPalette.Window, QColor("#F5F5F5"))
+            palette.setColor(QPalette.WindowText, QColor("#212121"))
+            palette.setColor(QPalette.Base, QColor("#FFFFFF"))
+            palette.setColor(QPalette.AlternateBase, QColor("#F5F5F5"))
+            palette.setColor(QPalette.Text, QColor("#212121"))
+            palette.setColor(QPalette.Button, QColor("#E0E0E0"))
+            palette.setColor(QPalette.ButtonText, QColor("#212121"))
+            palette.setColor(QPalette.Highlight, QColor("#6200EE"))
             palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
-            self.theme_btn.setText("Dark Mode")
+            palette.setColor(QPalette.ToolTipBase, QColor("#FFFFFF"))
+            palette.setColor(QPalette.ToolTipText, QColor("#212121"))
+        
         self.setPalette(palette)
-
+        
         style = """
+        QWidget {
+            font-family: 'Segoe UI', Arial, sans-serif;
+        }
+        QMainWindow {
+            background-color: palette(window);
+        }
         QFrame {
             border-radius: 8px;
+            background-color: palette(base);
         }
         QPushButton {
             border-radius: 6px;
             padding: 8px 16px;
             font-weight: 500;
+            min-width: 80px;
+            border: 1px solid palette(button);
         }
-        QPushButton:enabled:hover {
+        QPushButton:hover {
             background-color: palette(highlight);
             color: palette(highlightedtext);
         }
-        QPushButton:checked {
+        QPushButton:pressed {
             background-color: palette(highlight);
             color: palette(highlightedtext);
         }
-        QListWidget, QTextEdit {
+        QPushButton:disabled {
+            color: palette(windowText);
+            background-color: palette(window);
+        }
+        QListWidget, QTextEdit, QLineEdit {
             border-radius: 6px;
             padding: 8px;
+            border: 1px solid palette(mid);
+            background-color: palette(base);
         }
         QTabWidget::pane {
             border-radius: 6px;
+            border: 1px solid palette(mid);
         }
-        QComboBox {
-            border-radius: 6px;
-            padding: 4px;
+        QTabBar::tab {
+            padding: 8px 16px;
+            border-radius: 4px;
+            margin-right: 4px;
+        }
+        QTabBar::tab:selected {
+            background-color: palette(highlight);
+            color: palette(highlightedtext);
+        }
+        QProgressBar {
+            border-radius: 4px;
+            border: 1px solid palette(mid);
+            text-align: center;
+        }
+        QProgressBar::chunk {
+            background-color: palette(highlight);
+            border-radius: 4px;
+        }
+        QLabel {
+            font-weight: 500;
         }
         """
         self.setStyleSheet(style)
 
-        for widget in self.findChildren(QWidget):
-            widget.setPalette(palette)
-            widget.style().unpolish(widget)
-            widget.style().polish(widget)
-            widget.update()
-
     def toggle_theme(self):
         self.dark_mode = not self.dark_mode
         self.apply_theme()
+
+    def toggle_maximized(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and event.y() < 40:
+            self.drag_pos = event.globalPos()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if hasattr(self, 'drag_pos'):
+            self.move(self.pos() + event.globalPos() - self.drag_pos)
+            self.drag_pos = event.globalPos()
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if hasattr(self, 'drag_pos'):
+            del self.drag_pos
 
     def dragEnterEvent(self, event):
         if self.is_logged_in and event.mimeData().hasUrls():
@@ -747,24 +1016,22 @@ class ClientGUI(QMainWindow):
             self.start_transfer_thread()
             self.progress_bar.setVisible(True)
             self.progress_label.setVisible(True)
+            self.speed_label.setVisible(True)
             self.progress_bar.setValue(0)
             self.thread.set_action('upload', file_paths=files, is_private=is_private)
-
-    def show_login_dialog(self):
-        dialog = LoginDialog(self, dark_mode=self.dark_mode)
-        if dialog.exec_():
-            username, password = dialog.get_credentials()
-            if username and password:
-                self.start_transfer_thread()
-                self.thread.set_action('login', username=username, password=password)
 
     def show_settings_dialog(self):
         dialog = SettingsDialog(self, dark_mode=self.dark_mode)
         if dialog.exec_():
             settings = dialog.get_settings()
-            if settings['password']:
+            if settings['dark_mode'] != self.dark_mode:
+                self.toggle_theme()
+            if settings['password'] or settings['display_name']:
                 self.start_transfer_thread()
-                self.thread.set_action('change_password', new_password=settings['password'])
+                if settings['password']:
+                    self.thread.set_action('change_password', new_password=settings['password'])
+                if settings['display_name']:
+                    self.thread.set_action('update_display_name', display_name=settings['display_name'])
             if settings['sync_folder']:
                 self.start_folder_sync(settings['sync_folder'])
             if settings['delete_account']:
@@ -799,22 +1066,27 @@ class ClientGUI(QMainWindow):
             except queue.Empty:
                 continue
 
-    def start_transfer_thread(self):
+    def start_transfer_thread(self, server_ip=None, port=1253):
         if not self.thread or not self.thread.isRunning():
             self.thread = FileTransferThread()
+            if server_ip:
+                self.thread.host = server_ip
+            if port:
+                self.thread.port = port
             self.thread.update_status.connect(self.update_status)
             self.thread.error_occurred.connect(self.show_error)
             self.thread.login_status.connect(self.handle_login_status)
             self.thread.update_file_list.connect(self.update_file_list)
             self.thread.transfer_progress.connect(self.update_progress)
             self.thread.notify.connect(self.show_notification)
+            self.thread.display_name_received.connect(self.update_display_name)
             self.thread.start()
 
     def handle_login_status(self, success):
         if success:
             self.is_logged_in = True
             self.username = self.thread.username
-            self.login_btn.setEnabled(False)
+            self.show_main_ui()
             self.logout_btn.setEnabled(True)
             self.download_btn.setEnabled(True)
             self.upload_btn.setEnabled(True)
@@ -824,18 +1096,24 @@ class ClientGUI(QMainWindow):
             self.delete_btn.setEnabled(True)
             self.pause_btn.setEnabled(True)
             self.update_status(f"Logged in as {self.username}")
+            self.setWindowTitle(f"File Transfer Client - {self.display_name or self.username}")
         else:
             self.is_logged_in = False
             self.username = None
+            self.display_name = None
             if self.thread:
                 self.thread.stop()
+
+    def update_display_name(self, display_name):
+        self.display_name = display_name
+        self.setWindowTitle(f"File Transfer Client - {self.display_name or self.username}")
 
     def logout(self):
         if self.thread and self.thread.isRunning():
             self.thread.set_action('logout')
             self.is_logged_in = False
             self.username = None
-            self.login_btn.setEnabled(True)
+            self.display_name = None
             self.logout_btn.setEnabled(False)
             self.download_btn.setEnabled(False)
             self.upload_btn.setEnabled(False)
@@ -848,6 +1126,8 @@ class ClientGUI(QMainWindow):
             self.private_file_list.clear()
             self.progress_bar.setVisible(False)
             self.progress_label.setVisible(False)
+            self.speed_label.setVisible(False)
+            self.setWindowTitle("File Transfer Client")
             if self.sync_observer:
                 self.sync_observer.stop()
                 self.sync_observer.join()
@@ -889,6 +1169,7 @@ class ClientGUI(QMainWindow):
         if file_names and self.thread and self.thread.isRunning():
             self.progress_bar.setVisible(True)
             self.progress_label.setVisible(True)
+            self.speed_label.setVisible(True)
             self.progress_bar.setValue(0)
             self.thread.set_action('download', file_names=file_names)
 
@@ -919,6 +1200,7 @@ class ClientGUI(QMainWindow):
                     if self.thread and self.thread.isRunning():
                         self.progress_bar.setVisible(True)
                         self.progress_label.setVisible(True)
+                        self.speed_label.setVisible(True)
                         self.progress_bar.setValue(0)
                         self.thread.set_action('upload', file_paths=file_paths, is_private=is_private)
 
@@ -950,21 +1232,25 @@ class ClientGUI(QMainWindow):
                 self.thread.set_action('share', file_names=[file_name, target_user])
 
     def update_status(self, message):
-        self.status_label.setText(f"Status: {message}")
+        if self.status_label:
+            self.status_label.setText(f"Status: {message}")
 
-    def update_progress(self, filename, current, total):
+    def update_progress(self, filename, current, total, speed):
         if total > 0:
             progress = int((current / total) * 100)
             self.progress_label.setText(f"Transfer Progress: {filename} ({current:,}/{total:,} bytes)")
+            self.speed_label.setText(f"Speed: {speed:.2f} MB/s")
             self.progress_bar.setValue(progress)
             if progress >= 100:
                 self.progress_bar.setVisible(False)
                 self.progress_label.setVisible(False)
+                self.speed_label.setVisible(False)
 
     def show_error(self, message):
         QMessageBox.critical(self, "Error", message)
         self.progress_bar.setVisible(False)
         self.progress_label.setVisible(False)
+        self.speed_label.setVisible(False)
 
     def show_notification(self, message):
         QMessageBox.information(self, "Notification", message)
