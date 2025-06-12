@@ -4,6 +4,8 @@ lib/
 include/
 shared/
 
+src/server/server_files/PAT
+
 lib64
 pyvenv.cfg
 

@@ -1,0 +1,3 @@
+INSTALL: flatpak install flathub io.qt.QtCreator
+
+RUN: flatpak run io.qt.QtCreator

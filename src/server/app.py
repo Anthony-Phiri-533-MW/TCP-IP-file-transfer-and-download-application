@@ -12,6 +12,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QPalette, QColor, QFont
 
+# Register custom SQLite3 datetime adapter to fix deprecation warning
 def adapt_datetime(dt):
     return dt.isoformat()
 sqlite3.register_adapter(datetime, adapt_datetime)
@@ -95,37 +96,6 @@ class ServerThread(QThread):
             self.log_message.emit(f"Error listing files: {str(e)}")
             return [], []
 
-    def search_files(self, user_id, query):
-        try:
-            with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT file_name FROM files 
-                    WHERE (is_private = 0 OR user_id = ? OR file_name IN (SELECT file_name FROM file_shares WHERE shared_with_user = ?))
-                    AND file_name LIKE ?
-                """, (user_id, user_id, f"%{query}%"))
-                files = [row[0] for row in cursor.fetchall()]
-                public_files = [f for f in files if not self.is_private_file(f, user_id)]
-                private_files = [f for f in files if self.is_private_file(f, user_id)]
-            return public_files, private_files
-        except Exception as e:
-            self.log_message.emit(f"Error searching files: {str(e)}")
-            return [], []
-
-    def is_private_file(self, file_name, user_id):
-        try:
-            with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT is_private, user_id FROM files WHERE file_name = ?", (file_name,))
-                result = cursor.fetchone()
-                if result:
-                    is_private, owner = result
-                    return is_private == 1 and owner == user_id
-                return False
-        except Exception as e:
-            self.log_message.emit(f"Error checking file privacy: {str(e)}")
-            return False
-
     def get_stats(self, timeframe='month'):
         stats = {
             'downloads': 0,
@@ -145,8 +115,6 @@ class ServerThread(QThread):
                     start_date = datetime.now() - timedelta(days=1)
                 elif timeframe == 'week':
                     start_date = datetime.now() - timedelta(days=7)
-                elif timeframe == 'year':
-                    start_date = datetime.now() - timedelta(days=365)
                 else:  # month
                     start_date = datetime.now() - timedelta(days=30)
                 
@@ -158,14 +126,14 @@ class ServerThread(QThread):
                 
                 cursor.execute("SELECT COUNT(*), SUM(size) FROM files")
                 result = cursor.fetchone()
-                stats['total_files'] = result[0] or 0
+                stats['total_files'] = result[0]
                 stats['total_storage_gb'] = (result[1] or 0) / (1024**3)
                 
                 cursor.execute("SELECT user_id, COUNT(*) FROM files GROUP BY user_id")
-                stats['files_per_user'] = dict(cursor.fetchall() or [])
+                stats['files_per_user'] = dict(cursor.fetchall())
                 
                 cursor.execute("SELECT user_id, COUNT(*) FROM downloads WHERE timestamp >= ? GROUP BY user_id", (start_date,))
-                stats['downloads_per_user'] = dict(cursor.fetchall() or [])
+                stats['downloads_per_user'] = dict(cursor.fetchall())
                 
         except sqlite3.Error as e:
             self.log_message.emit(f"Database error getting stats: {str(e)}")
@@ -183,7 +151,7 @@ class ServerThread(QThread):
             self.log_message.emit(f"Error listing users: {str(e)}")
             return []
 
-    def send_file_to_client(self, client_socket, file_name, client_address, user_id, offset=0):
+    def send_file_to_client(self, client_socket, file_name, client_address, user_id):
         file_path = os.path.join(SERVER_FILES_DIR, file_name)
         
         if not os.path.exists(file_path):
@@ -198,6 +166,7 @@ class ServerThread(QThread):
                 """, (file_name,))
                 result = cursor.fetchone()
                 
+                # Check if user has access (owner, public, or shared)
                 has_access = False
                 if result:
                     if result[0] == 0:  # Public file
@@ -212,13 +181,13 @@ class ServerThread(QThread):
                 
                 if has_access:
                     if os.path.isdir(file_path):
+                        # Send folder as zip
                         zip_path = file_path + '.zip'
                         shutil.make_archive(file_path, 'zip', file_path)
                         file_size = os.path.getsize(zip_path)
                         client_socket.send(f"FILE_SIZE:{file_size}:ZIP".encode('utf-8'))
                         
                         with open(zip_path, 'rb') as f:
-                            f.seek(offset)
                             while True:
                                 data = f.read(1024)
                                 if not data:
@@ -230,7 +199,6 @@ class ServerThread(QThread):
                         client_socket.send(f"FILE_SIZE:{file_size}".encode('utf-8'))
                         
                         with open(file_path, 'rb') as f:
-                            f.seek(offset)
                             while True:
                                 data = f.read(1024)
                                 if not data:
@@ -258,6 +226,7 @@ class ServerThread(QThread):
         
         try:
             if is_folder:
+                # Receive zip file
                 zip_path = file_path + '.zip'
                 received_size = 0
                 with open(zip_path, 'wb') as f:
@@ -272,6 +241,7 @@ class ServerThread(QThread):
                     os.makedirs(file_path, exist_ok=True)
                     shutil.unpack_archive(zip_path, file_path, 'zip')
                     os.remove(zip_path)
+                    # Update database with folder and its contents
                     for root, _, files in os.walk(file_path):
                         for fname in files:
                             rel_path = os.path.relpath(os.path.join(root, fname), SERVER_FILES_DIR)
@@ -340,20 +310,12 @@ class ServerThread(QThread):
                         self.handle_list_request(client_socket, user_id)
                     elif data.startswith("DOWNLOAD:"):
                         self.handle_download(client_socket, data[9:], client_address, user_id)
-                    elif data.startswith("DOWNLOAD_RESUME:"):
-                        self.handle_download_resume(client_socket, data[15:], client_address, user_id)
                     elif data.startswith("UPLOAD:"):
                         self.handle_upload(client_socket, data[7:], client_address, user_id)
                     elif data.startswith("SHARE:"):
                         self.handle_share(client_socket, data[6:], user_id)
                     elif data.startswith("CHANGE_PASSWORD:"):
                         self.handle_password_change(client_socket, data[15:], user_id)
-                    elif data.startswith("DELETE_ACCOUNT:"):
-                        self.handle_delete_account(client_socket, data[14:], client_address)
-                    elif data.startswith("SEARCH:"):
-                        self.handle_search(client_socket, data[7:], user_id)
-                    elif data.startswith("DELETE_FILE:"):
-                        self.handle_delete_file(client_socket, data[12:], user_id)
                     else:
                         client_socket.send(f"Unknown command: {data[:100]}".encode('utf-8'))
                         
@@ -422,22 +384,9 @@ class ServerThread(QThread):
             client_socket.send("Error: Authentication required.".encode('utf-8'))
             return
             
-        file_name = data.strip()
-        self.send_file_to_client(client_socket, file_name, client_address, user_id)
-
-    def handle_download_resume(self, client_socket, data, client_address, user_id):
-        if not user_id:
-            client_socket.send("Error: Authentication required.".encode('utf-8'))
-            return
-            
-        parts = data.split(':')
-        if len(parts) != 2:
-            client_socket.send("Error: Invalid format. Use 'filename:offset'".encode('utf-8'))
-            return
-            
-        file_name, offset = parts
-        offset = int(offset)
-        self.send_file_to_client(client_socket, file_name, client_address, user_id, offset)
+        file_names = [f.strip() for f in data.split(',') if f.strip()]
+        for file_name in file_names:
+            self.send_file_to_client(client_socket, file_name, client_address, user_id)
 
     def handle_upload(self, client_socket, data, client_address, user_id):
         if not user_id:
@@ -479,11 +428,13 @@ class ServerThread(QThread):
         try:
             with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
                 cursor = conn.cursor()
+                # Verify file exists and user is owner
                 cursor.execute("SELECT user_id FROM files WHERE file_name = ? AND is_private = 1", (file_name,))
                 if cursor.fetchone()[0] != user_id:
                     client_socket.send("Error: You can only share your private files.".encode('utf-8'))
                     return
                     
+                # Verify target user exists
                 cursor.execute("SELECT 1 FROM users WHERE username = ?", (target_user,))
                 if not cursor.fetchone():
                     client_socket.send("Error: Target user does not exist.".encode('utf-8'))
@@ -507,85 +458,12 @@ class ServerThread(QThread):
         try:
             with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
                 conn.execute("UPDATE users SET password = ? WHERE username = ?", (new_password, user_id))
-                conn.commit()
                 client_socket.send("Password updated successfully.".encode('utf-8'))
                 self.log_message.emit(f"User '{user_id}' updated password")
         except Exception as e:
             client_socket.send(f"Error: {str(e)}".encode('utf-8'))
 
-    def handle_delete_account(self, client_socket, data, client_address):
-        if not data:
-            client_socket.send("Error: Username required.".encode('utf-8'))
-            return
-            
-        username = data.strip()
-        try:
-            with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT 1 FROM users WHERE username = ?", (username,))
-                if not cursor.fetchone():
-                    client_socket.send("Error: User does not exist.".encode('utf-8'))
-                    return
-                
-                conn.execute("DELETE FROM file_shares WHERE file_name IN (SELECT file_name FROM files WHERE user_id = ?)", (username,))
-                conn.execute("DELETE FROM files WHERE user_id = ?", (username,))
-                conn.execute("DELETE FROM downloads WHERE user_id = ?", (username,))
-                conn.execute("DELETE FROM users WHERE username = ?", (username,))
-                conn.commit()
-                
-                client_socket.send("Account deleted successfully.".encode('utf-8'))
-                self.log_message.emit(f"User '{username}' deleted account from {client_address}")
-                self.user_list_updated.emit(self.get_users())
-        except Exception as e:
-            client_socket.send(f"Error: {str(e)}".encode('utf-8'))
-            self.log_message.emit(f"Error deleting account '{username}': {str(e)}")
-
-    def handle_search(self, client_socket, data, user_id):
-        if not user_id:
-            client_socket.send("Error: Authentication required.".encode('utf-8'))
-            return
-        query = data.strip()
-        public_files, private_files = self.search_files(user_id, query)
-        response = f"PUBLIC:{','.join(public_files)}|PRIVATE:{','.join(private_files)}"
-        client_socket.sendall(response.encode('utf-8'))
-
-    def handle_delete_file(self, client_socket, data, user_id):
-        if not user_id:
-            client_socket.send("Error: Authentication required.".encode('utf-8'))
-            return
-            
-        file_name = data.strip()
-        try:
-            with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT user_id FROM files WHERE file_name = ?", (file_name,))
-                result = cursor.fetchone()
-                if not result or result[0] != user_id:
-                    client_socket.send(f"Error: You can only delete files you uploaded ('{file_name}').".encode('utf-8'))
-                    return
-                
-                file_path = os.path.join(SERVER_FILES_DIR, file_name)
-                if os.path.exists(file_path):
-                    if os.path.isdir(file_path):
-                        shutil.rmtree(file_path)
-                    else:
-                        os.remove(file_path)
-                
-                conn.execute("DELETE FROM files WHERE file_name = ?", (file_name,))
-                conn.execute("DELETE FROM file_shares WHERE file_name = ?", (file_name,))
-                conn.commit()
-                
-                client_socket.send(f"File '{file_name}' deleted successfully.".encode('utf-8'))
-                self.log_message.emit(f"User '{user_id}' deleted file '{file_name}'")
-                self.file_list_updated.emit(self.list_server_files(user_id))
-        except Exception as e:
-            client_socket.send(f"Error: {str(e)}".encode('utf-8'))
-            self.log_message.emit(f"Error deleting file '{file_name}': {str(e)}")
-
     def run(self):
-        if os.geteuid() == 0:
-            self.log_message.emit("Warning: Running as root is not recommended. Consider running as a regular user to avoid GUI issues.")
-        
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
@@ -659,18 +537,18 @@ class UserDialog(QDialog):
     def apply_theme(self):
         palette = self.palette()
         if self.dark_mode:
-            palette.setColor(QPalette.Window, QColor("#1E1E2F"))
+            palette.setColor(QPalette.Window, QColor("#121212"))  # 60% primary
             palette.setColor(QPalette.WindowText, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Base, QColor("#1E1E2F"))
+            palette.setColor(QPalette.Base, QColor("#1E1E1E"))   # 30% secondary
             palette.setColor(QPalette.Text, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Button, QColor("#4A90E2"))
-            palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
+            palette.setColor(QPalette.Button, QColor("#BB86FC"))  # 10% accent
+            palette.setColor(QPalette.ButtonText, QColor("#121212"))
         else:
-            palette.setColor(QPalette.Window, QColor("#F5F7FA"))
-            palette.setColor(QPalette.WindowText, QColor("#2C3E50"))
-            palette.setColor(QPalette.Base, QColor("#F5F7FA"))
-            palette.setColor(QPalette.Text, QColor("#2C3E50"))
-            palette.setColor(QPalette.Button, QColor("#2E7D32"))
+            palette.setColor(QPalette.Window, QColor("#F5F5F5"))
+            palette.setColor(QPalette.WindowText, QColor("#212121"))
+            palette.setColor(QPalette.Base, QColor("#FFFFFF"))
+            palette.setColor(QPalette.Text, QColor("#212121"))
+            palette.setColor(QPalette.Button, QColor("#6200EE"))
             palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
         self.setPalette(palette)
 
@@ -678,14 +556,14 @@ class UserDialog(QDialog):
         return self.username_input.text().strip(), self.password_input.text().strip()
 
 class ServerGUI(QMainWindow):
-    stats_updated = pyqtSignal(dict)
+    stats_updated = pyqtSignal(dict)  # Define signal to fix AttributeError
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("File Transfer Server")
-        self.setGeometry(100, 100, 900, 600)
+        self.setGeometry(100, 100, 900, 101)
         self.server_thread = None
-        self.dark_mode = True
+        self.dark_mode = False
         self.init_ui()
         self.apply_theme()
 
@@ -711,7 +589,7 @@ class ServerGUI(QMainWindow):
         self.stop_btn.setFixedHeight(40)
         self.stop_btn.setEnabled(False)
         
-        self.theme_btn = QPushButton("Light Mode")
+        self.theme_btn = QPushButton("Dark Mode")
         self.theme_btn.clicked.connect(self.toggle_theme)
         self.theme_btn.setFixedHeight(40)
         
@@ -733,7 +611,6 @@ class ServerGUI(QMainWindow):
         files_label.setStyleSheet("font-weight: bold;")
         
         self.file_list = QListWidget()
-        self.file_list.itemSelectionChanged.connect(lambda: self.highlight_button(self.file_list))
         
         files_layout.addWidget(files_label)
         files_layout.addWidget(self.file_list)
@@ -750,7 +627,7 @@ class ServerGUI(QMainWindow):
         timeframe_layout = QHBoxLayout()
         timeframe_label = QLabel("Timeframe:")
         self.timeframe_combo = QComboBox()
-        self.timeframe_combo.addItems(["Day", "Week", "Month", "Year"])
+        self.timeframe_combo.addItems(["Day", "Week", "Month"])
         self.timeframe_combo.currentTextChanged.connect(self.update_stats_timeframe)
         timeframe_layout.addWidget(timeframe_label)
         timeframe_layout.addWidget(self.timeframe_combo)
@@ -781,7 +658,6 @@ class ServerGUI(QMainWindow):
         user_btn_layout.addWidget(delete_user_btn)
         
         self.user_list = QListWidget()
-        self.user_list.itemSelectionChanged.connect(lambda: self.highlight_button(self.user_list))
         
         users_layout.addWidget(users_label)
         users_layout.addLayout(user_btn_layout)
@@ -807,23 +683,25 @@ class ServerGUI(QMainWindow):
     def apply_theme(self):
         palette = QPalette()
         if self.dark_mode:
-            palette.setColor(QPalette.Window, QColor("#1E1E2F"))
+            # Modern dark palette: 60% #121212, 30% #1E1E1E, 10% #BB86FC
+            palette.setColor(QPalette.Window, QColor("#121212"))
             palette.setColor(QPalette.WindowText, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Base, QColor("#1E1E2F"))
+            palette.setColor(QPalette.Base, QColor("#1E1E1E"))
             palette.setColor(QPalette.Text, QColor("#E0E0E0"))
-            palette.setColor(QPalette.Button, QColor("#4A90E2"))
-            palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-            palette.setColor(QPalette.Highlight, QColor("#FF6B6B"))
-            palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
+            palette.setColor(QPalette.Button, QColor("#BB86fc"))
+            palette.setColor(QPalette.ButtonText, QColor("#121212"))
+            palette.setColor(QPalette.Highlight, QColor("#03DAC6"))
+            palette.setColor(QPalette.HighlightedText, QColor("#121212"))
             self.theme_btn.setText("Light Mode")
         else:
-            palette.setColor(QPalette.Window, QColor("#F5F7FA"))
-            palette.setColor(QPalette.WindowText, QColor("#2C3E50"))
-            palette.setColor(QPalette.Base, QColor("#F5F7FA"))
-            palette.setColor(QPalette.Text, QColor("#2C3E50"))
-            palette.setColor(QPalette.Button, QColor("#2E7D32"))
+            # Light palette: 60% #F5F5F5, 30% #FFFFFF, 10% #6200EE
+            palette.setColor(QPalette.Window, QColor("#333333"))
+            palette.setColor(QPalette.WindowText, QColor("#ffffff"))
+            palette.setColor(QPalette.Base, QColor("#ffffff"))
+            palette.setColor(QPalette.Text, QColor("#808080"))
+            palette.setColor(QPalette.Button, QColor("#6200EE"))
             palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-            palette.setColor(QPalette.Highlight, QColor("#4CAF50"))
+            palette.setColor(QPalette.Highlight, QColor("#03DAC6"))
             palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
             self.theme_btn.setText("Dark Mode")
         self.setPalette(palette)
@@ -836,14 +714,6 @@ class ServerGUI(QMainWindow):
             border-radius: 6px;
             padding: 8px 16px;
             font-weight: 500;
-        }
-        QPushButton:enabled:hover {
-            background-color: palette(highlight);
-            color: palette(highlightedtext);
-        }
-        QPushButton:checked {
-            background-color: palette(highlight);
-            color: palette(highlightedtext);
         }
         QListWidget, QTextEdit {
             border-radius: 6px;
@@ -859,6 +729,7 @@ class ServerGUI(QMainWindow):
         """
         self.setStyleSheet(style)
 
+        # Force update all child widgets
         for widget in self.findChildren(QWidget):
             widget.setPalette(palette)
             widget.style().unpolish(widget)
@@ -869,74 +740,17 @@ class ServerGUI(QMainWindow):
         self.dark_mode = not self.dark_mode
         self.apply_theme()
 
-    def highlight_button(self, list_widget):
-        for btn in [self.start_btn, self.stop_btn, self.theme_btn]:
-            btn.setChecked(False)
-        if list_widget.selectedItems():
-            btn = self.sender()
-            if btn:
-                btn.setChecked(True)
-
-    def start_server(self):
-        if not self.server_thread or not self.server_thread.isRunning():
-            self.server_thread = ServerThread()
-            self.server_thread.log_message.connect(self.append_log)
-            self.server_thread.file_list_updated.connect(self.update_file_list)
-            self.server_thread.stats_updated.connect(self.update_stats)
-            self.server_thread.user_list_updated.connect(self.update_user_list)
-            self.server_thread.start()
-            self.start_btn.setEnabled(False)
-            self.stop_btn.setEnabled(True)
-
-    def stop_server(self):
-        if self.server_thread and self.server_thread.isRunning():
-            self.server_thread.stop()
-            self.server_thread.wait()
-            self.start_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
-            self.file_list.clear()
-            self.stats_display.clear()
-            self.user_list.clear()
-
-    def update_file_list(self, files):
-        self.file_list.clear()
-        self.file_list.addItems(files)
-
-    def update_stats_timeframe(self, timeframe):
-        if self.server_thread and self.server_thread.isRunning():
-            stats = self.server_thread.get_stats(timeframe.lower())
-            self.update_stats(stats)
-
-    def update_stats(self, stats):
-        text = (
-            f"Downloads (last {self.timeframe_combo.currentText().lower()}): {stats['downloads']}\n"
-            f"Total Days with Downloads: {stats['total_days_with_downloads']}\n"
-            f"Total Files: {stats['total_files']}\n"
-            f"Total Storage: {stats['total_storage_gb']:.2f} GB\n"
-            f"Files per User: {stats['files_per_user']}\n"
-            f"Downloads per User: {stats['downloads_per_user']}\n"
-            f"Active Connections: {stats['active_connections']}"
-        )
-        self.stats_display.setText(text)
-
-    def update_user_list(self, users):
-        self.user_list.clear()
-        self.user_list.addItems(users)
-
     def add_user(self):
         dialog = UserDialog(self, dark_mode=self.dark_mode)
         if dialog.exec_():
             username, password = dialog.get_credentials()
             if username and password:
                 try:
-                    if self.server_thread and self.server_thread.isRunning():
-                        with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-                            conn.execute("INSERT INTO users (username, password) VALUES (?, ?)",
-                                       (username, password))
-                        self.server_thread.user_list_updated.emit(self.server_thread.get_users())
-                        self.append_log(f"Added user '{username}'")
-                    else:
-                        raise Exception("Server not running")
+                    with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+                        conn.execute("INSERT INTO users (username, password) VALUES (?, ?)",
+                                   (username, password))
+                    self.user_list_updated.emit(self.get_users())
+                    self.append_log(f"Added user '{username}'")
                 except sqlite3.IntegrityError:
                     QMessageBox.critical(self, "Error", "Username already exists.")
                 except Exception as e:
@@ -952,23 +766,81 @@ class ServerGUI(QMainWindow):
                                    QMessageBox.Yes | QMessageBox.No)
         if reply == QMessageBox.Yes:
             try:
-                if self.server_thread and self.server_thread.isRunning():
-                    with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
-                        conn.execute("DELETE FROM users WHERE username = ?", (username,))
-                        conn.execute("DELETE FROM file_shares WHERE file_name IN (SELECT file_name FROM files WHERE user_id = ?)", (username,))
-                        conn.execute("DELETE FROM files WHERE user_id = ?", (username,))
-                        conn.execute("DELETE FROM downloads WHERE user_id = ?", (username,))
-                        conn.commit()
-                    self.server_thread.user_list_updated.emit(self.server_thread.get_users())
-                    self.append_log(f"Deleted user '{username}'")
-                else:
-                    raise Exception("Server not running")
+                with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+                    conn.execute("DELETE FROM users WHERE username = ?", (username,))
+                    conn.execute("DELETE FROM files WHERE user_id = ?", (username,))
+                    conn.execute("DELETE FROM file_shares WHERE shared_with_user = ?", (username,))
+                self.user_list_updated.emit(self.get_users())
+                self.append_log(f"Deleted user '{username}'")
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to delete user: {str(e)}")
+
+    def start_server(self):
+        if not self.server_thread or not self.server_thread.isRunning():
+            self.server_thread = ServerThread()
+            self.server_thread.log_message.connect(self.append_log_message)
+            self.server_thread.file_list_updated.connect(self.update_file_list)
+            self.server_thread.stats_updated.connect(self.update_stats)
+            self.server_thread.user_list_updated.connect(self.user_list_updated)
+            self.server_thread.start()
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+
+    def stop_server(self):
+        if self.server_thread and self.server_thread.isRunning():
+            self.server_thread.stop()
+            self.server_thread.wait()
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
 
     def append_log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_display.append(f"[{timestamp}] {message}")
+
+    def update_file_list(self, files):
+        self.file_list.clear()
+        if not files:
+            self.file_list.addItem("No files available.")
+        else:
+            self.file_list.addItems(files)
+
+    def update_stats(self, stats):
+        self.stats_display.clear()
+        timeframe = self.timeframe_combo.currentText().lower()
+        self.stats_display.append(f"Active Connections: {stats['active_connections']}")
+        self.stats_display.append(f"Downloads (Last {timeframe.capitalize()}): {stats['downloads']}")
+        self.stats_display.append(f"Total Days with Downloads: {stats['total_days_with_downloads']}")
+        self.stats_display.append(f"Total Files Stored: {stats['total_files']}")
+        self.stats_display.append(f"Total Storage: {stats['total_storage_gb']:.2f} GB")
+        self.stats_display.append("\nFiles Per User:")
+        for user, count in stats['files_per_user'].items():
+            self.stats_display.append(f"  {user}: {count} files")
+        self.stats_display.append("\nDownloads Per User:")
+        for user, count in stats['downloads_per_user'].items():
+            self.stats_display.append(f"  {user}: {count} downloads")
+
+    def update_stats_timeframe(self):
+        if self.server_thread and self.server_thread.isRunning():
+            stats = self.server_thread.get_stats(self.timeframe_combo.currentText().lower())
+            self.update_stats(stats)
+
+    def user_list_updated(self, users):
+        self.user_list.clear()
+        if not users:
+            self.user_list.addItem("No users registered.")
+        else:
+            self.user_list.addItems(users)
+
+    def get_users(self):
+        try:
+            with sqlite3.connect('file_transfer.db', detect_types=sqlite3.PARSE_DECLTYPES) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT username FROM users")
+                users = [row[0] for row in cursor.fetchall()]
+            return users
+        except Exception as e:
+            self.append_log(f"Error listing users: {str(e)}")
+            return []
 
     def closeEvent(self, event):
         if self.server_thread and self.server_thread.isRunning():
@@ -980,7 +852,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     
     font = QFont()
-    font.setFamily("Segoe UI" if sys.platform == "win32" else "Arial")
+    font.setFamily("Arial")
     font.setPointSize(10)
     app.setFont(font)
     
