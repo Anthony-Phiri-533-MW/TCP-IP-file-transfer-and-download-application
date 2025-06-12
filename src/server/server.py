@@ -202,7 +202,8 @@ class ServerThread(QThread):
         file_path = os.path.join(SERVER_FILES_DIR, file_name)
         
         if not os.path.exists(file_path):
-            client_socket.send(f"Error: File '{file_name}' not found.".encode('utf-8'))
+            client_socket.send(f"Error: File '{file_name}' not found.\n".encode('utf-8'))
+            self.log_message.emit(f"Error: File '{file_name}' not found for {client_address}")
             return
             
         try:
@@ -221,7 +222,7 @@ class ServerThread(QThread):
                         has_access = True
                     else:  # Check shares
                         cursor.execute("SELECT 1 FROM file_shares WHERE file_name = ? AND shared_with_user = ?", 
-                                     (file_name, user_id))
+                                    (file_name, user_id))
                         if cursor.fetchone():
                             has_access = True
                 
@@ -231,8 +232,9 @@ class ServerThread(QThread):
                         zip_path = file_path + '.zip'
                         shutil.make_archive(file_path, 'zip', file_path)
                         file_size = os.path.getsize(zip_path)
-                        client_socket.send(f"FILE_SIZE:{file_size}:ZIP".encode('utf-8'))
-                        
+                        header = f"FILE_SIZE:{file_size}:ZIP\n"
+                        client_socket.sendall(header.encode('utf-8'))  # Send header explicitly
+                        self.log_message.emit(f"Sending header: {header.strip()} for {file_name}")
                         with open(zip_path, 'rb') as f:
                             f.seek(offset)
                             while True:
@@ -243,8 +245,9 @@ class ServerThread(QThread):
                         os.remove(zip_path)
                     else:
                         file_size = os.path.getsize(file_path)
-                        client_socket.send(f"FILE_SIZE:{file_size}".encode('utf-8'))
-                        
+                        header = f"FILE_SIZE:{file_size}\n"
+                        client_socket.sendall(header.encode('utf-8'))  # Send header explicitly
+                        self.log_message.emit(f"Sending header: {header.strip()} for {file_name}")
                         with open(file_path, 'rb') as f:
                             f.seek(offset)
                             while True:
@@ -265,12 +268,13 @@ class ServerThread(QThread):
                     
                     self.stats_updated.emit(self.get_stats())
                 else:
-                    client_socket.send(f"Error: Access denied for file '{file_name}'".encode('utf-8'))
+                    client_socket.send(f"Error: Access denied for file '{file_name}'\n".encode('utf-8'))
+                    self.log_message.emit(f"Access denied for '{file_name}' to {client_address}")
                     
         except Exception as e:
             self.log_message.emit(f"Error sending file '{file_name}': {str(e)}")
             try:
-                client_socket.send(f"Error: {str(e)}".encode('utf-8'))
+                client_socket.send(f"Error: {str(e)}\n".encode('utf-8'))
             except:
                 pass
 
@@ -467,10 +471,12 @@ class ServerThread(QThread):
 
     def handle_download(self, client_socket, data, client_address, user_id):
         if not user_id:
-            client_socket.send("Error: Authentication required.".encode('utf-8'))
+            client_socket.send("Error: Authentication required.\n".encode('utf-8'))
+            self.log_message.emit(f"Download failed: Authentication required for {client_address}")
             return
             
         file_name = data.strip()
+        self.log_message.emit(f"Handling download request for '{file_name}' from {client_address}")
         self.send_file_to_client(client_socket, file_name, client_address, user_id)
 
     def handle_download_resume(self, client_socket, data, client_address, user_id):

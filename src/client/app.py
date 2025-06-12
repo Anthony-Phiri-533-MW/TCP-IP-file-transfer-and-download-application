@@ -188,107 +188,98 @@ class FileTransferThread(QThread):
 
     def start_download(self, file_name):
         if file_name in self.download_tasks:
-            return  # Already downloading or paused
-        
-        self.client_socket.send(f"DOWNLOAD:{file_name}".encode('utf-8'))
-        response = self.client_socket.recv(1024).decode('utf-8')
-        
-        if response.startswith("Error:"):
-            self.error_occurred.emit(response)
             return
-            
-        is_zip = False
-        if response.startswith("FILE_SIZE:"):
-            parts = response.split(':')
+
+        self.client_socket.send(f"DOWNLOAD:{file_name}".encode('utf-8'))
+
+        # Flush buffer carefully until we find the correct header
+        header = b""
+        while b"\n" not in header:
+            chunk = self.client_socket.recv(1024)
+            if not chunk:
+                self.error_occurred.emit("Error: Server closed connection unexpectedly")
+                return
+            header += chunk
+
+        try:
+            header_line, remaining_data = header.split(b"\n", 1)
+            header_str = header_line.decode('utf-8').strip()
+        except Exception as e:
+            self.error_occurred.emit(f"Header decode failed: {str(e)}")
+            return
+
+        # Validate header
+        if not header_str.startswith("FILE_SIZE:"):
+            # Scan for valid header inside corrupted buffer
+            index = header.find(b"FILE_SIZE:")
+            if index != -1:
+                try:
+                    header = header[index:]
+                    header_line, remaining_data = header.split(b"\n", 1)
+                    header_str = header_line.decode('utf-8').strip()
+                except Exception as e:
+                    self.error_occurred.emit(f"Recovered header failed: {str(e)}")
+                    return
+            else:
+                self.error_occurred.emit(f"Error: Invalid header format - {header_str}")
+                return
+
+        # Parse file size and zip flag
+        parts = header_str.split(':')
+        try:
             file_size = int(parts[1])
-            offset = 0
-            if len(parts) > 2 and parts[2] == 'ZIP':
-                is_zip = True
-                
-            if not os.path.exists(self.download_dir):
-                os.makedirs(self.download_dir)
-                
-            file_path = os.path.join(self.download_dir, file_name + ('.zip' if is_zip else ''))
-            received_size = 0
-            start_time = time.time()
-            self.last_transfer_update = start_time
-            self.last_bytes_transferred = 0
-            
-            try:
-                mode = 'wb' if offset == 0 else 'ab'
-                with open(file_path, mode) as f:
+            is_zip = len(parts) > 2 and parts[2] == "ZIP"
+        except Exception as e:
+            self.error_occurred.emit(f"Error parsing header: {header_str}")
+            return
+
+        # Create output path
+        if not os.path.exists(self.download_dir):
+            os.makedirs(self.download_dir)
+
+        file_path = os.path.join(self.download_dir, file_name + ('.zip' if is_zip else ''))
+        received_size = len(remaining_data)
+
+        try:
+            with open(file_path, 'wb') as f:
+                f.write(remaining_data)
+                with tqdm(total=file_size, unit='B', unit_scale=True, desc=file_name, initial=received_size) as pbar:
+                    self.last_transfer_update = time.time()
+                    self.last_bytes_transferred = received_size
+
                     while received_size < file_size:
                         if file_name in self.paused_downloads:
                             self.download_tasks[file_name] = (f, received_size, file_size)
                             return
+
                         data = self.client_socket.recv(min(4096, file_size - received_size))
-                        if not data:  # Check for connection closure
-                            raise ConnectionError("Connection closed by server")
+                        if not data:
+                            break
+
                         f.write(data)
                         received_size += len(data)
+                        pbar.update(len(data))
                         speed = self.calculate_speed(received_size)
                         self.transfer_progress.emit(file_name, received_size, file_size, speed)
-                    
-                transfer_time = time.time() - start_time
-                speed = (file_size / (1024 * 1024)) / transfer_time if transfer_time > 0 else 0  # MB/s
-                
-                del self.download_tasks[file_name]
-                if is_zip:
-                    shutil.unpack_archive(file_path, os.path.join(self.download_dir, file_name), 'zip')
-                    os.remove(file_path)
-                
-                self.update_status.emit(f"Downloaded '{file_name}' to '{self.download_dir}' (Speed: {speed:.2f} MB/s)")
-                if self.enable_notifications:
-                    self.notify.emit(f"Download complete: {file_name}")
-            except ConnectionError as e:
-                self.error_occurred.emit(f"Download failed: {str(e)}. Connection lost.")
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-            except Exception as e:
-                self.error_occurred.emit(f"Error saving file: {str(e)}")
-                if os.path.exists(file_path):
-                    os.remove(file_path)
 
-    def resume_download(self, file_name):
-        if file_name not in self.download_tasks:
-            return
-        
-        f, offset, total = self.download_tasks[file_name]
-        self.client_socket.send(f"DOWNLOAD_RESUME:{file_name}:{offset}".encode('utf-8'))
-        response = self.client_socket.recv(1024).decode('utf-8')
-        
-        if response.startswith("Error:"):
-            self.error_occurred.emit(response)
-            return
-            
-        try:
-            start_time = time.time()
-            self.last_transfer_update = start_time
-            self.last_bytes_transferred = offset
-            
-            with tqdm(total=total, unit='B', unit_scale=True, desc=file_name, initial=offset) as pbar:
-                while offset < total:
-                    if file_name in self.paused_downloads:
-                        self.download_tasks[file_name] = (f, offset, total)
-                        return
-                    data = self.client_socket.recv(min(4096, total - offset))
-                    if not data:
-                        break
-                    f.write(data)
-                    offset += len(data)
-                    speed = self.calculate_speed(offset)
-                    pbar.update(len(data))
-                    self.transfer_progress.emit(file_name, offset, total, speed)
-                
-            transfer_time = time.time() - start_time
-            speed = ((total - self.download_tasks[file_name][1]) / (1024 * 1024)) / transfer_time if transfer_time > 0 else 0  # MB/s
-            
-            del self.download_tasks[file_name]
-            self.update_status.emit(f"Resumed and completed '{file_name}' (Speed: {speed:.2f} MB/s)")
+            if file_name in self.download_tasks:
+                del self.download_tasks[file_name]
+
+            if is_zip:
+                extract_dir = os.path.join(self.download_dir, file_name)
+                shutil.unpack_archive(file_path, extract_dir, 'zip')
+                os.remove(file_path)
+
+            self.update_status.emit(f"Downloaded '{file_name}' to '{self.download_dir}'")
             if self.enable_notifications:
-                self.notify.emit(f"Download resumed and complete: {file_name}")
+                self.notify.emit(f"Download complete: {file_name}")
+
         except Exception as e:
-            self.error_occurred.emit(f"Error resuming file: {str(e)}")
+            self.error_occurred.emit(f"Error saving file: {str(e)}")
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+
 
     def pause_download(self, file_name):
         self.paused_downloads.add(file_name)
