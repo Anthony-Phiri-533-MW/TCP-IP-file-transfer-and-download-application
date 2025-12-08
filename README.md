@@ -72,7 +72,7 @@ python server.py
 ```
 
 - In the Server GUI:
-  - Click **Start Server** to listen on `0.0.0.0:1253`  
+  - Click **Start Server** to listen on `0.0.0.0:1253`(or set to ypu prefered port)  
   - Use the **Users** tab to add users (username, password, optional display name)  
   - Monitor files, statistics, and logs via their respective tabs  
   - Click **Stop Server** to shut down
